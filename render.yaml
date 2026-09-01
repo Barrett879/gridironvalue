@@ -1,0 +1,27 @@
+# Render deployment. The disk is the reason to choose Render over Streamlit
+# Community Cloud: pasted PrizePicks boards are written to CACHE_DIR, and
+# without a persistent disk every paste is lost on restart.
+services:
+  - type: web
+    name: gridironvalue
+    runtime: python
+    plan: starter          # free tier sleeps; a sleeping app loses nothing but is slow to wake
+    buildCommand: pip install -r requirements.txt
+    # $PORT is assigned by Render. --server.headless keeps Streamlit from trying
+    # to open a browser. enableCORS false is required behind their proxy.
+    startCommand: >
+      streamlit run app.py
+      --server.port $PORT
+      --server.address 0.0.0.0
+      --server.headless true
+      --server.enableCORS false
+      --server.enableXsrfProtection false
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8        # Render honours this; Streamlit Cloud does not
+      - key: GRIDIRONVALUE_LOG
+        value: WARNING
+    disks:
+      - name: gridironvalue-data
+        mountPath: /data     # cache.py switches CACHE_DIR to /data/cache when this exists
+        sizeGB: 1

@@ -1,0 +1,325 @@
+{
+  "version": "m1",
+  "trained_through": 2025,
+  "trained_at": "2026-09-01T13:45:21+00:00",
+  "sklearn": "1.7.2",
+  "joblib": "1.5.2",
+  "feature_columns": [
+    "f_games_prior",
+    "f_games_prior_season",
+    "f_career_targets",
+    "f_r3_targets",
+    "f_r8_targets",
+    "f_std_targets",
+    "f_career_receptions",
+    "f_r3_receptions",
+    "f_r8_receptions",
+    "f_std_receptions",
+    "f_career_receiving_yards",
+    "f_r3_receiving_yards",
+    "f_r8_receiving_yards",
+    "f_std_receiving_yards",
+    "f_career_receiving_tds",
+    "f_r3_receiving_tds",
+    "f_r8_receiving_tds",
+    "f_std_receiving_tds",
+    "f_career_carries",
+    "f_r3_carries",
+    "f_r8_carries",
+    "f_std_carries",
+    "f_career_rushing_yards",
+    "f_r3_rushing_yards",
+    "f_r8_rushing_yards",
+    "f_std_rushing_yards",
+    "f_career_rushing_tds",
+    "f_r3_rushing_tds",
+    "f_r8_rushing_tds",
+    "f_std_rushing_tds",
+    "f_career_attempts",
+    "f_r3_attempts",
+    "f_r8_attempts",
+    "f_std_attempts",
+    "f_career_completions",
+    "f_r3_completions",
+    "f_r8_completions",
+    "f_std_completions",
+    "f_career_passing_yards",
+    "f_r3_passing_yards",
+    "f_r8_passing_yards",
+    "f_std_passing_yards",
+    "f_career_passing_tds",
+    "f_r3_passing_tds",
+    "f_r8_passing_tds",
+    "f_std_passing_tds",
+    "f_career_passing_interceptions",
+    "f_r3_passing_interceptions",
+    "f_r8_passing_interceptions",
+    "f_std_passing_interceptions",
+    "f_career_sacks_suffered",
+    "f_r3_sacks_suffered",
+    "f_r8_sacks_suffered",
+    "f_std_sacks_suffered",
+    "f_career_fg_att",
+    "f_r3_fg_att",
+    "f_r8_fg_att",
+    "f_std_fg_att",
+    "f_career_fg_made",
+    "f_r3_fg_made",
+    "f_r8_fg_made",
+    "f_std_fg_made",
+    "f_career_pat_att",
+    "f_r3_pat_att",
+    "f_r8_pat_att",
+    "f_std_pat_att",
+    "f_career_off_snaps",
+    "f_r3_off_snaps",
+    "f_r8_off_snaps",
+    "f_std_off_snaps",
+    "f_career_routes_run_proxy",
+    "f_r3_routes_run_proxy",
+    "f_r8_routes_run_proxy",
+    "f_std_routes_run_proxy",
+    "f_shrunk_catch_rate",
+    "f_shrunk_ypt",
+    "f_shrunk_ypc",
+    "f_shrunk_ypa",
+    "f_shrunk_comp_rate",
+    "f_shrunk_rec_td_rate",
+    "f_shrunk_rush_td_rate",
+    "f_shrunk_target_share",
+    "f_shrunk_rush_share",
+    "f_team_prior_off_plays",
+    "f_team_r4_off_plays",
+    "f_team_prior_off_pass_rate",
+    "f_team_r4_off_pass_rate",
+    "f_team_prior_off_proe",
+    "f_team_r4_off_proe",
+    "f_team_prior_off_dropbacks",
+    "f_team_r4_off_dropbacks",
+    "f_team_prior_off_designed_rush",
+    "f_team_r4_off_designed_rush",
+    "f_team_prior_off_epa_play",
+    "f_team_r4_off_epa_play",
+    "f_team_prior_off_pass_att",
+    "f_team_r4_off_pass_att",
+    "f_team_proe_centered",
+    "f_opp_prior_def_allowed_epa_play",
+    "f_opp_prior_def_allowed_pass_att",
+    "f_opp_prior_def_allowed_designed_rush",
+    "f_opp_prior_def_allowed_plays",
+    "depth_rank_capped",
+    "is_starter",
+    "injury_severity",
+    "practice_limitation",
+    "on_injury_report",
+    "is_home",
+    "spread_line",
+    "total_line",
+    "div_game",
+    "team_implied_total",
+    "opp_implied_total",
+    "team_spread",
+    "rest_days"
+  ],
+  "league_priors": {
+    "catch_rate": 0.6654435770459786,
+    "yards_per_target": 7.394605308016342,
+    "yards_per_carry": 4.321189696883449,
+    "yards_per_attempt": 7.128117743363571,
+    "completion_rate": 0.6417804061767376,
+    "rec_td_per_target": 0.04601898774406416,
+    "rush_td_per_carry": 0.03359185996869219
+  },
+  "targets": {
+    "targets": {
+      "file": "targets_m1.joblib",
+      "positions": [
+        "WR",
+        "TE",
+        "RB"
+      ],
+      "loss": "poisson",
+      "gate": "pass",
+      "skill_vs_baseline_pct": 6.4,
+      "n_train": 50272,
+      "present_as": "model"
+    },
+    "receptions": {
+      "file": "receptions_m1.joblib",
+      "positions": [
+        "WR",
+        "TE",
+        "RB"
+      ],
+      "loss": "poisson",
+      "gate": "pass",
+      "skill_vs_baseline_pct": 5.9,
+      "n_train": 50272,
+      "present_as": "model"
+    },
+    "receiving_yards": {
+      "file": "receiving_yards_m1.joblib",
+      "positions": [
+        "WR",
+        "TE",
+        "RB"
+      ],
+      "loss": "squared_error",
+      "gate": "pass",
+      "skill_vs_baseline_pct": 5.1,
+      "n_train": 50272,
+      "present_as": "model"
+    },
+    "receiving_tds": {
+      "file": "receiving_tds_m1.joblib",
+      "positions": [
+        "WR",
+        "TE",
+        "RB"
+      ],
+      "loss": "poisson",
+      "gate": "FAIL",
+      "skill_vs_baseline_pct": -4.6,
+      "n_train": 50272,
+      "present_as": "baseline"
+    },
+    "carries": {
+      "file": "carries_m1.joblib",
+      "positions": [
+        "RB",
+        "QB",
+        "FB"
+      ],
+      "loss": "poisson",
+      "gate": "pass",
+      "skill_vs_baseline_pct": 9.5,
+      "n_train": 22381,
+      "present_as": "model"
+    },
+    "rushing_yards": {
+      "file": "rushing_yards_m1.joblib",
+      "positions": [
+        "RB",
+        "QB",
+        "FB"
+      ],
+      "loss": "squared_error",
+      "gate": "pass",
+      "skill_vs_baseline_pct": 5.6,
+      "n_train": 22381,
+      "present_as": "model"
+    },
+    "rushing_tds": {
+      "file": "rushing_tds_m1.joblib",
+      "positions": [
+        "RB",
+        "QB",
+        "FB"
+      ],
+      "loss": "poisson",
+      "gate": "FAIL",
+      "skill_vs_baseline_pct": -0.9,
+      "n_train": 22381,
+      "present_as": "baseline"
+    },
+    "attempts": {
+      "file": "attempts_m1.joblib",
+      "positions": [
+        "QB"
+      ],
+      "loss": "poisson",
+      "gate": "pass",
+      "skill_vs_baseline_pct": 12.5,
+      "n_train": 6282,
+      "present_as": "model"
+    },
+    "completions": {
+      "file": "completions_m1.joblib",
+      "positions": [
+        "QB"
+      ],
+      "loss": "poisson",
+      "gate": "pass",
+      "skill_vs_baseline_pct": 11.0,
+      "n_train": 6282,
+      "present_as": "model"
+    },
+    "passing_yards": {
+      "file": "passing_yards_m1.joblib",
+      "positions": [
+        "QB"
+      ],
+      "loss": "squared_error",
+      "gate": "pass",
+      "skill_vs_baseline_pct": 13.2,
+      "n_train": 6282,
+      "present_as": "model"
+    },
+    "passing_tds": {
+      "file": "passing_tds_m1.joblib",
+      "positions": [
+        "QB"
+      ],
+      "loss": "poisson",
+      "gate": "pass",
+      "skill_vs_baseline_pct": 4.1,
+      "n_train": 6282,
+      "present_as": "model"
+    },
+    "passing_interceptions": {
+      "file": "passing_interceptions_m1.joblib",
+      "positions": [
+        "QB"
+      ],
+      "loss": "poisson",
+      "gate": "weak",
+      "skill_vs_baseline_pct": 1.8,
+      "n_train": 6282,
+      "present_as": "model_low_confidence"
+    },
+    "sacks_suffered": {
+      "file": "sacks_suffered_m1.joblib",
+      "positions": [
+        "QB"
+      ],
+      "loss": "poisson",
+      "gate": "pass",
+      "skill_vs_baseline_pct": 4.7,
+      "n_train": 6282,
+      "present_as": "model"
+    },
+    "fg_att": {
+      "file": "fg_att_m1.joblib",
+      "positions": [
+        "K"
+      ],
+      "loss": "poisson",
+      "gate": "weak",
+      "skill_vs_baseline_pct": 11.3,
+      "n_train": 5273,
+      "present_as": "model_low_confidence"
+    },
+    "fg_made": {
+      "file": "fg_made_m1.joblib",
+      "positions": [
+        "K"
+      ],
+      "loss": "poisson",
+      "gate": "weak",
+      "skill_vs_baseline_pct": 9.4,
+      "n_train": 5273,
+      "present_as": "model_low_confidence"
+    },
+    "pat_att": {
+      "file": "pat_att_m1.joblib",
+      "positions": [
+        "K"
+      ],
+      "loss": "poisson",
+      "gate": "pass",
+      "skill_vs_baseline_pct": 6.2,
+      "n_train": 5273,
+      "present_as": "model"
+    }
+  }
+}

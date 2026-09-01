@@ -1,0 +1,30 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+.pytest_cache/
+
+# The cache holds two very different kinds of file.
+#
+# RAW SOURCE DATA (play-by-play, participation, weekly stats, snap counts) is
+# ~100MB, is rebuildable from nflverse in minutes, and is needed only to REBUILD
+# the training table. It must never be committed.
+#
+# DERIVED RUNTIME ARTIFACTS are small and the deployed app cannot start without
+# them, because a fresh host has no way to rebuild a 63k-row backfill inside a
+# web request. Those are un-ignored below.
+cache/*
+!cache/.gitkeep
+!cache/player_week_2016_2025_v1.parquet
+!cache/team_week_2016_2025_v1.parquet
+!cache/league_season_2016_2025_v1.parquet
+!cache/availability_2025_2025_v1.parquet
+
+# Pasted PrizePicks boards are the user's own data and are per-deployment state,
+# not source. On a host with a persistent disk they survive restarts; on one
+# without, they are lost on restart, which is a real difference between hosts.
+cache/pp_lines_*.json
+
+# Per-week projections are derived from the committed artifacts and are
+# regenerated on demand, version-stamped in the filename.
+cache/predictions_*.parquet

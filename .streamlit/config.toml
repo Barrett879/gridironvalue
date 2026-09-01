@@ -1,0 +1,19 @@
+# Light is the shipped default (theme.py THEME_DEFAULT_DARK = False). Keeping
+# base="light" here matters: it is what any iframe-rendered component inherits
+# before our own tokens apply, so a mismatch shows as a dark flash on load.
+[theme]
+base = "light"
+primaryColor = "#16d4c1"
+backgroundColor = "#f4f6f8"
+secondaryBackgroundColor = "#ffffff"
+textColor = "#14142a"
+
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"
+showErrorDetails = true

@@ -1,0 +1,31 @@
+# GridironValue dependencies. Exact pins on everything.
+#
+# The version set is deliberately IDENTICAL to DiamondValue's (Desktop/Claude/
+# MLB Predict/requirements.txt) so idioms port between the two projects without
+# surprises. Two consequences worth knowing:
+#  - pandas is held at 2.x on purpose. pandas 3.0 is out and pip will install it
+#    by default; its copy-on-write and default-string-dtype changes alter join
+#    and parquet round-trip behavior, and there is no reason to absorb that risk
+#    on a build that ports ~6k lines of pandas 2.x idiom.
+#  - scikit-learn and joblib are pinned to the exact versions the shipped model
+#    artifacts in models/ are saved with. Version drift silently breaks
+#    joblib.load on a host rebuild. DO NOT bump these two without retraining and
+#    re-committing the artifacts.
+streamlit==1.59.1
+numpy==2.3.5
+pandas==2.3.3
+pyarrow==22.0.0
+plotly==6.3.0
+scikit-learn==1.7.2
+joblib==1.5.2
+requests==2.32.5
+
+# nflverse data access. nflreadpy returns Polars, so polars is a hard runtime
+# dependency even though the codebase works in pandas everywhere past the
+# fetch boundary. See gridlib/fetch.py for why we mostly bypass the wrapper.
+nflreadpy==0.1.5
+polars==1.44.1
+
+# Dev only (tests). Harmless in production; keeps the leakage suite runnable
+# anywhere the app installs.
+pytest==8.3.4

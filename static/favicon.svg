@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="GridironValue">
+  <rect width="64" height="64" rx="14" fill="#0a0a14"/>
+  <ellipse cx="32" cy="32" rx="21" ry="13" transform="rotate(-18 32 32)" fill="none" stroke="#16d4c1" stroke-width="4"/>
+  <g stroke="#16d4c1" stroke-width="3.4" stroke-linecap="round">
+    <line x1="24" y1="34.5" x2="40" y2="29.5"/>
+    <line x1="27.5" y1="28.5" x2="29.5" y2="35.5"/>
+    <line x1="34.5" y1="26.5" x2="36.5" y2="33.5"/>
+  </g>
+</svg>
