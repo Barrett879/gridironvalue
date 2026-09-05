@@ -20,6 +20,14 @@ cache/*
 !cache/league_season_2016_2025_v1.parquet
 !cache/availability_2025_2025_v1.parquet
 
+# The two calibration layers. WITHOUT THESE THE DEPLOYED BOARD SILENTLY REVERTS
+# to gap-based leans, which is the bug the probability layer exists to fix:
+# `uncertainty.available()` returns False, `prob_over` returns NaN for every row,
+# and `compare()` falls back to model-minus-line. Nothing errors. A fresh clone
+# was checked and did exactly that before these were un-ignored.
+!cache/prob_calibration_v1.parquet
+!cache/mean_calibration_v1.parquet
+
 # Pasted boards and their FROZEN projections are COMMITTED, because the
 # published site has no persistent disk and the accuracy record must not be
 # per-deployment state. Anything written at runtime there dies on the next
