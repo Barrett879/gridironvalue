@@ -90,6 +90,12 @@ def main() -> None:
     # Priors from seasons strictly before the first season we would predict.
     priors = F.league_priors(pw, args.through + 1)
     feat = F.build(pw[pw["season"] <= args.through], lg, priors)
+    # The UNION, kept for the inference-time completeness check. Each model is
+    # trained on its OWN column list, because a block can be excluded for one
+    # target: positional defence ships for skill positions and is excluded from
+    # QB targets, where it regressed on both folds. Selecting features once for
+    # every target would have trained the QB models on the columns the ablation
+    # explicitly measured them WITHOUT.
     cols = F.feature_columns(feat)
     MODELS_DIR.mkdir(exist_ok=True)
 
@@ -112,12 +118,16 @@ def main() -> None:
         if len(sub) < 500:
             print(f"  {target:<24} SKIPPED (only {len(sub)} rows)")
             continue
+        tcols = F.feature_columns(feat, target)
         mdl = HistGradientBoostingRegressor(loss=loss, **PARAMS)
-        mdl.fit(sub[cols], sub[target].astype(float))
+        mdl.fit(sub[tcols], sub[target].astype(float))
         path = MODELS_DIR / f"{target}_{VERSION}.joblib"
         joblib.dump(mdl, path)
         registry["targets"][target] = {
             "file": path.name, "positions": positions, "loss": loss,
+            # Explicit, not reconstructed from the union at serve time: an
+            # explicit list cannot drift away from what was actually fitted.
+            "feature_columns": tcols,
             "gate": verdict, "skill_vs_baseline_pct": skill,
             "n_train": int(len(sub)),
             # What the UI should present for this target.

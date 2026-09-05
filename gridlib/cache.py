@@ -48,6 +48,25 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 CACHE_DIR = _RENDER_DISK if _RENDER_DISK.parent.exists() else _REPO_ROOT / "cache"
 
 
+# ── Read-only deployments ────────────────────────────────────────────────────
+# On a host with no persistent disk (Streamlit Community Cloud), anything the
+# app writes at runtime survives only until the next restart. For most of the
+# cache that is harmless: projections regenerate on demand.
+#
+# It is NOT harmless for the accuracy record. A board pasted on the live site
+# would save, freeze a snapshot stamped with whatever model was loaded, show for
+# a while, and then vanish, leaving the deployed record silently different from
+# the canonical one in the repo. The whole value of freezing is that the record
+# cannot drift.
+#
+# So a deployment declares itself read-only and the record becomes a COMMITTED
+# artifact: boards are pasted locally, frozen locally, and pushed. The live site
+# serves them and refuses to write. Set GRIDIRONVALUE_READONLY=1 in the host's
+# secrets. Unset locally, which is where pasting is meant to happen.
+READ_ONLY = os.environ.get("GRIDIRONVALUE_READONLY", "").strip().lower() in (
+    "1", "true", "yes", "on")
+
+
 def seed_disk_cache_from_repo() -> None:
     """Copy the committed repo cache into the persistent disk for any files the
     disk does not already have. Gap-fill only, best-effort, never fatal.

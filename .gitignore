@@ -20,10 +20,19 @@ cache/*
 !cache/league_season_2016_2025_v1.parquet
 !cache/availability_2025_2025_v1.parquet
 
-# Pasted PrizePicks boards are the user's own data and are per-deployment state,
-# not source. On a host with a persistent disk they survive restarts; on one
-# without, they are lost on restart, which is a real difference between hosts.
-cache/pp_lines_*.json
+# Pasted boards and their FROZEN projections are COMMITTED, because the
+# published site has no persistent disk and the accuracy record must not be
+# per-deployment state. Anything written at runtime there dies on the next
+# restart, which would leave the live record silently different from this one.
+#
+# So the record is a build artifact: paste locally, freeze locally, commit, push.
+# The deployment sets GRIDIRONVALUE_READONLY=1 and refuses to write either file,
+# which also means a visitor cannot overwrite the record from the public site.
+#
+# Cost is roughly 800KB per week of the season. Worth it: without these two the
+# published site has no board and no record.
+!cache/pp_lines_*.json
+!cache/pp_frozen_*.json
 
 # Per-week projections are derived from the committed artifacts and are
 # regenerated on demand, version-stamped in the filename.

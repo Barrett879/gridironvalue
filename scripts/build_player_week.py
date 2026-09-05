@@ -271,6 +271,100 @@ def build_season(season: int) -> pd.DataFrame | None:
                                .clip(upper=3))
     df["is_starter"] = (df["depth_rank_capped"] == 1).astype(float)
 
+    # ── Bio: age and draft pedigree ──
+    # Age curves are steeper in football than in baseball. Running backs decline
+    # sharply in their late twenties and receivers commonly break out in year
+    # three, so a 24-year-old and a 31-year-old with identical prior games are
+    # not the same projection. `players.parquet` has carried birth_date the
+    # whole time and nothing used it.
+    bio = fetch.player_bio()
+    if not bio.empty:
+        df = df.merge(bio, on="gsis_id", how="left")
+        # `age` needs `gameday`, which arrives with the schedule merge further
+        # down, so it is derived there. Everything date-free is derived here.
+        df["experience"] = (df["season"]
+                            - pd.to_numeric(df.get("rookie_season"),
+                                            errors="coerce")).clip(lower=0)
+        df["draft_round"] = pd.to_numeric(df.get("draft_round"), errors="coerce")
+        # Undrafted is a real signal, not missing data, so it gets its own value
+        # rather than a NaN a tree will route arbitrarily.
+        df["draft_round"] = df["draft_round"].fillna(8.0)
+    else:
+        for c in ("experience", "draft_round", "height", "weight",
+                  "birth_date", "rookie_season"):
+            df[c] = pd.NA
+
+    # ── NextGen Stats: the tracking layer ──
+    # Separation, cushion, air-yards share and YAC-over-expected are the closest
+    # football analog to Statcast quality-of-contact. Coverage is QUALIFIED
+    # players only (about 73 receivers a week), so most of a depth chart is
+    # missing here by design; the block is judged on the rows it covers.
+    _NGS = {
+        "receiving": ["avg_cushion", "avg_separation", "avg_intended_air_yards",
+                      "percent_share_of_intended_air_yards",
+                      "avg_yac_above_expectation"],
+        "rushing": ["efficiency", "percent_attempts_gte_eight_defenders",
+                    "avg_time_to_los", "rush_yards_over_expected_per_att"],
+        "passing": ["avg_time_to_throw", "avg_air_yards_differential",
+                    "aggressiveness", "avg_air_yards_to_sticks",
+                    "completion_percentage_above_expectation"],
+    }
+    for kind, keep in _NGS.items():
+        ngs = fetch.load_nextgen(kind)
+        if ngs is None or ngs.empty:
+            for c in keep:
+                df[f"ngs_{c}"] = pd.NA
+            continue
+        sub = ngs[ngs["season"] == season]
+        cols = [c for c in keep if c in sub.columns]
+        if sub.empty or not cols:
+            for c in keep:
+                df[f"ngs_{c}"] = pd.NA
+            continue
+        sub = (sub[["season", "week", "player_gsis_id"] + cols]
+               .rename(columns={"player_gsis_id": "gsis_id"})
+               .drop_duplicates(["season", "week", "gsis_id"]))
+        sub = sub.rename(columns={c: f"ngs_{c}" for c in cols})
+        df = df.merge(sub, on=["season", "week", "gsis_id"], how="left")
+
+    # ── PFR advanced: broken tackles and drops ──
+    # The two things the box score cannot see. Nothing here scrapes PFR; these
+    # are nflverse's MIRRORED release parquets, which is why they are usable at
+    # all, since PFR itself sits behind bot verification this project does not
+    # work around. One file per season and coverage starts in 2018, so 2016-17
+    # rows carry NaN by construction rather than by failure.
+    #
+    # SAME-GAME measurements, exactly like NextGen: a receiver's drops in week 6
+    # are counted during week 6. They enter only as lagged history.
+    _PFR = {
+        "rec": ["receiving_broken_tackles", "receiving_drop",
+                "receiving_drop_pct", "receiving_rat"],
+        "rush": ["rushing_broken_tackles"],
+        "pass": ["passing_drops", "passing_drop_pct"],
+    }
+    _xw = _pfr_crosswalk()
+    for kind, keep in _PFR.items():
+        adv = fetch.load_pfr_advstats(kind, season)
+        if adv is None or adv.empty or _xw.empty:
+            for c in keep:
+                df[f"pfr_{c}"] = pd.NA
+            continue
+        cols = [c for c in keep if c in adv.columns]
+        if not cols or "pfr_player_id" not in adv.columns:
+            for c in keep:
+                df[f"pfr_{c}"] = pd.NA
+            continue
+        sub = adv[["week", "pfr_player_id"] + cols].copy()
+        sub["gsis_id"] = sub["pfr_player_id"].map(_xw)
+        sub = (sub.dropna(subset=["gsis_id"])
+                  .drop(columns=["pfr_player_id"])
+                  .drop_duplicates(["week", "gsis_id"])
+                  .rename(columns={c: f"pfr_{c}" for c in cols}))
+        df = df.merge(sub, on=["week", "gsis_id"], how="left")
+        for c in keep:
+            if f"pfr_{c}" not in df.columns:
+                df[f"pfr_{c}"] = pd.NA
+
     # ── Availability: the injury report, which IS pregame ──
     # Published Wednesday to Friday for a Sunday game (and shifted for other
     # slates), so unlike almost everything else in this table it is genuinely
@@ -320,7 +414,7 @@ def build_season(season: int) -> pd.DataFrame | None:
     gm = g[["game_id", "gameday", "weekday", "spread_line", "total_line",
             "home_implied_total", "away_implied_total", "home_team", "away_team",
             "roof_type", "surface", "div_game", "home_rest", "away_rest",
-            "temp", "wind"]].copy()
+            "stadium_id", "old_game_id", "temp", "wind"]].copy()
     df = df.merge(gm, on="game_id", how="left")
 
     is_home = df["team"] == df["home_team"]
@@ -331,8 +425,85 @@ def build_season(season: int) -> pd.DataFrame | None:
     # Spread from THIS team's perspective: negative means this team is favored.
     df["team_spread"] = np.where(is_home, -df["spread_line"], df["spread_line"])
     df["rest_days"] = np.where(is_home, df["home_rest"], df["away_rest"])
+    df["opp_rest_days"] = np.where(is_home, df["away_rest"], df["home_rest"])
     df = df.drop(columns=["home_implied_total", "away_implied_total",
                           "home_rest", "away_rest", "home_team", "away_team"])
+
+    # ── Referee crew ──
+    # From the OFFICIALS feed, never `schedules.referee`: that column is 100%
+    # populated for completed seasons and 0% for the upcoming one, making it a
+    # postgame field like temp and wind. The officials file publishes crews a
+    # few days before kickoff, so it is the only source that exists at inference
+    # as well as in training. Joined on `old_game_id`, the NFL numeric id;
+    # joining on `game_id` matches nothing and looks like an unpublished file.
+    _ref = fetch.referee_by_game()
+    if not _ref.empty and "old_game_id" in df.columns:
+        df["old_game_id"] = df["old_game_id"].astype(str)
+        df = df.merge(_ref, on="old_game_id", how="left")
+    else:
+        df["referee"] = pd.NA
+
+    # ── Venue and schedule context ──
+    # The football analog of park factors and day-versus-night. All of it is
+    # knowable weeks ahead, and none of it was encoded: roof_type and surface
+    # were carried as strings and dropped by the feature builder for being
+    # non-numeric, so the model has never known whether a game is indoors.
+    _ROOF = {"outdoors": 0.0, "retractable": 1.0, "dome": 2.0}
+    _unmapped = set(df["roof_type"].dropna().unique()) - set(_ROOF)
+    if _unmapped:
+        raise ValueError(
+            f"Unmapped roof_type values {_unmapped} in season {season}. They "
+            "would silently encode as outdoors. Extend _ROOF."
+        )
+    df["roof_indoor"] = df["roof_type"].map(_ROOF).fillna(0.0)
+
+    # `.strip()` is load-bearing: the feed carries both 'grass' and 'grass ',
+    # and the trailing-space variant (93 games) was being classified as TURF,
+    # because lowercasing does not remove whitespace. An unknown surface (44
+    # games, empty string) stays 0, which is the majority class.
+    df["is_turf"] = (~df["surface"].astype(str).str.lower().str.strip()
+                     .isin(["grass", "nan", "none", ""])).astype(float)
+
+    # Altitude, which is a real and very local effect: only two venues in the
+    # league sit high enough to matter, and both are extreme rather than
+    # marginal. A general elevation column would be almost all zeros, so this is
+    # explicit about the two that count.
+    #
+    # This column was ALL ZEROS on first build: `stadium_id` was not in the
+    # schedule merge above, and the `if "stadium_id" in df.columns` guard that
+    # used to sit here turned the missing column into a plausible constant
+    # instead of an error. No silent fallback now. Denver hosts games in every
+    # season, so a season with no high-altitude rows means the join broke.
+    _ALTITUDE_M = {"DEN00": 1610.0, "MEX00": 2240.0}
+    df["altitude_m"] = df["stadium_id"].map(_ALTITUDE_M).fillna(0.0)
+    if not (df["altitude_m"] > 0).any():
+        raise ValueError(
+            f"No high-altitude rows in season {season}. Denver hosts games "
+            "every season, so the stadium_id join is broken."
+        )
+
+    # Rest DIFFERENTIAL, not just own rest. A team on six days against one on
+    # thirteen is a different game from both teams on seven, and only the
+    # difference carries that.
+    df["rest_diff"] = (pd.to_numeric(df.get("rest_days"), errors="coerce")
+                       - pd.to_numeric(df.get("opp_rest_days"), errors="coerce")
+                       ).fillna(0.0)
+
+    # Primetime. A standalone national window is a different game script from a
+    # one-of-eight Sunday afternoon kickoff: the baseball analog is day versus
+    # night, and it is the one schedule fact a viewer would name first.
+    _wd = df.get("weekday").astype(str) if "weekday" in df.columns else None
+    df["is_primetime"] = (_wd.isin(["Thursday", "Monday"]).astype(float)
+                          if _wd is not None else 0.0)
+    df["week_of_season"] = pd.to_numeric(df["week"], errors="coerce")
+
+    # Age, now that the schedule has supplied a kickoff date. Computed against
+    # the actual game date rather than a season midpoint, because a rookie born
+    # in September and one born in March are nearly a year apart on the curve.
+    _born = pd.to_datetime(df.get("birth_date"), errors="coerce")
+    _gameday = pd.to_datetime(df.get("gameday"), errors="coerce")
+    df["age"] = ((_gameday - _born).dt.days / 365.25
+                 if _born.notna().any() else pd.NA)
 
     df["fumbles_lost"] = (
         df.get("rushing_fumbles_lost", 0).fillna(0)

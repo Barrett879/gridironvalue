@@ -25,6 +25,11 @@ from gridlib.util import esc
 FEED_URL = "https://api.prizepicks.com/projections?league_id=9&per_page=1000"
 
 
+def _read_only() -> bool:
+    from gridlib.cache import READ_ONLY
+    return READ_ONLY
+
+
 def resolve_and_persist(season: int, week: int, games: pd.DataFrame | None = None):
     """Merge any freshly-pasted text into the saved set and persist it.
 
@@ -61,11 +66,44 @@ def resolve_and_persist(season: int, week: int, games: pd.DataFrame | None = Non
                 merged = (pd.concat([existing, batch], ignore_index=True)
                           if existing is not None else batch)
                 props.save_lines(season, dest, props.collapse_alt_lines(merged))
+                # Freeze what the model says RIGHT NOW for these lines. Doing
+                # it at grading time instead would score a three-week-old board
+                # against a model retrained since, so the record would improve
+                # every time the models are refit. First seen wins, so this
+                # cannot overwrite an earlier paste's projection.
+                _freeze_week(season, dest)
             elsewhere = {int(w): len(b) for w, b in routed.items()
                          if w != "_unrouted" and int(w) != week}
             st.session_state["pp_routed_elsewhere"] = elsewhere
     st.session_state["pp_parse_note"] = note
     return props.load_lines(season, week)
+
+
+def _freeze_week(season: int, week: int) -> int:
+    """Snapshot the model's number for every not-yet-frozen line in a week.
+
+    Best effort by design: a board pasted for a week with no depth chart yet
+    has nothing to project against, which is normal rather than an error, and
+    the lines freeze on the next paste once the chart publishes. Never let this
+    break the paste itself, because losing the lines is worse than losing the
+    snapshot.
+    """
+    try:
+        lines = props.load_lines(season, week)
+        if lines is None or lines.empty:
+            return 0
+        proj = predict.project_week_cached(season, week)
+        if proj is None or proj.empty:
+            return 0
+        reg = predict.load_registry()
+        table, _meta = props.compare(lines, proj, reg)
+        if table.empty:
+            return 0
+        stamp = (reg or {}).get("trained_at") or (reg or {}).get("version")
+        return props.freeze_projections(season, week, table, stamp)
+    except Exception as e:  # noqa: BLE001
+        props.logger.warning("could not freeze week %s w%s: %s", season, week, e)
+        return 0
 
 
 def saved_count(season: int, week: int) -> int:
@@ -121,6 +159,11 @@ def props_by_name(scope_proj: pd.DataFrame, season: int, week: int) -> dict:
             "odds_type": r.get("odds_type", "standard"),
             "sides": r.get("sides", "both"),
             "tier": r.get("tier"), "tier_edge": r.get("tier_edge"),
+            # Without this the per-player rows fall back to mean formatting and
+            # a 58% touchdown chance renders as "0.6", which is the exact
+            # confusion the probability treatment exists to prevent.
+            "kind": r.get("kind", "mean"),
+            "p_over": r.get("p_over"),
         })
     return out
 
@@ -274,24 +317,35 @@ def render_board(scope_proj: pd.DataFrame, season: int, week: int,
 
     st.markdown(_ledger_html(table), unsafe_allow_html=True)
 
-    # Name the stats where a lean is not evidence. Sorting them to the bottom is
-    # not enough on its own: a reader who scrolls still meets a big red gap and
-    # has no way to know it points the wrong way.
-    neg = (table[table["tier"] == "negative"] if "tier" in table.columns
+    # Name the stats where a lean is not evidence. Sorting them to the bottom
+    # is not enough on its own: a reader who scrolls still meets a confident
+    # looking row and has no way to know it is not worth acting on.
+    #
+    # The numbers come from data/stat_reliability.csv rather than being written
+    # here. This text hardcoded them twice and went stale twice, most recently
+    # when moving the lean from the gap to P(Over) turned rushing yards from
+    # -7.7 into +2.3 and left the page warning against its own fix.
+    rel = props.reliability_table()
+    weak_tiers = {"negative", "none"}
+    low = (table[table["tier"].isin(weak_tiers)] if "tier" in table.columns
            else table.iloc[0:0])
-    if not neg.empty:
-        stats = ", ".join(sorted(set(neg["stat"])))
+    if not low.empty:
+        by_stat = []
+        for stat in sorted(set(low["stat"])):
+            sub = low[low["stat"] == stat]
+            edge = sub["tier_edge"].dropna()
+            e = f" ({float(edge.iloc[0]):+.1f} pts)" if len(edge) else ""
+            by_stat.append(f"{esc(str(stat))}{e}")
         st.markdown(
             store.render_notice(
-                f"<b>{len(neg)} of these are yardage lines ({esc(stats)}), and "
-                "this model picks sides on them WORSE than a coin flip.</b> "
-                "Measured out of sample: rushing yards -9.4 points and "
-                "receiving yards -5.7 against simply always taking the more "
-                "common side. Yards are volume times efficiency and the "
-                "efficiency half is close to noise, so the projection ends up a "
-                "noisier estimate of what a season average already tells you. "
-                "They sort to the bottom and are shown for completeness, not as "
-                "signal."),
+                f"<b>{len(low)} of these are stats where a lean is not "
+                "evidence:</b> " + ", ".join(by_stat) + ". The edge shown is "
+                "measured out of sample against simply always taking the more "
+                "common side, so a number at or below zero means the lean adds "
+                "nothing. Touchdown lines are the clearest case: they hit about "
+                "86% of the time because they mostly resolve Under, which is a "
+                "base rate rather than skill. They sort to the bottom and are "
+                "shown for completeness, not as signal."),
             unsafe_allow_html=True)
 
     if not thin.empty:
@@ -345,16 +399,57 @@ def _ledger_html(table: pd.DataFrame) -> str:
             f'<span class="st">{esc(r["stat"])}'
             f'{_tier_badge(r.get("tier"), r.get("tier_edge"))}'
             f'{_odds_badge(r.get("odds_type"))}{badge}</span>'
-            f'<span class="num">{r["model"]:.1f}</span>'
+            f'{_fmt_model(r)}'
             f'<span class="num line">{r["line"]:.1f}</span>'
-            f'<span class="num diff {cls}">{r["diff"]:+.1f}</span>'
+            f'{_fmt_chance(r)}'
             f'<span class="lean {cls}">{esc(r["lean"])}</span>'
             f"</div>")
     head = ('<div class="gv-ledger-head">'
             '<span class="nm">Player</span><span class="st">Stat</span>'
             '<span class="num">Model</span><span class="num">Line</span>'
-            '<span class="num">Gap</span><span class="lean">Lean</span></div>')
+            '<span class="num">Chance</span><span class="lean">Lean</span></div>')
     return f'<div class="gv-ledger">{head}{"".join(rows)}</div>'
+
+
+def _fmt_model(r) -> str:
+    """A touchdown prop's model value is a PROBABILITY, so it must not render as
+    a stat line. "0.6" next to a 0.5 line reads as expected touchdowns, which is
+    a different and materially larger number: 0.69 expected touchdowns is only a
+    50% chance of scoring one. Percent makes the units unmistakable."""
+    if r.get("kind") == "probability":
+        return f'<span class="num">{100 * float(r["model"]):.0f}%</span>'
+    return f'<span class="num">{r["model"]:.1f}</span>'
+
+
+def _fmt_chance(r) -> str:
+    """Confidence in the lean actually shown, as a percentage.
+
+    The GAP is deliberately not the headline any more. It was the decision rule
+    until now and it was biased: these stats are right-skewed, so a line below
+    the projected mean can still sit above the median, and leaning on the gap
+    put the model on the More side of 66% of receiving-yards lines when only 41%
+    went Over. Reporting the probability of the leaned side puts the number a
+    reader acts on in front of them, and makes "+7.8 yards" visibly a coin flip
+    when that is what it is.
+
+    Rows with no fitted distribution (combination props, kickers, the fantasy
+    composite) still show the gap, which is visually distinct from a percentage.
+    """
+    cls = "over" if r.get("lean") == "More" else "under" if r.get("lean") == "Less" else ""
+    conf = None
+    if r.get("kind") == "probability":
+        conf = max(float(r["model"]), 1 - float(r["model"]))
+    elif r.get("p_over") is not None and pd.notna(r.get("p_over")):
+        conf = max(float(r["p_over"]), 1 - float(r["p_over"]))
+    if conf is not None:
+        from gridlib import uncertainty as _u
+        # Above the validated range, say so rather than printing a precise
+        # number nothing has checked.
+        txt = (f"{100 * _u.VALIDATED_MAX:.0f}%+" if conf > _u.VALIDATED_MAX
+               else f"{100 * conf:.0f}%")
+        return f'<span class="num diff {cls}">{txt}</span>'
+    cls = "over" if r["diff"] > 0 else "under" if r["diff"] < 0 else ""
+    return f'<span class="num diff {cls}">{r["diff"]:+.1f}</span>'
 
 
 def render_player_lines(lines_for_player: list) -> str:
@@ -371,14 +466,14 @@ def render_player_lines(lines_for_player: list) -> str:
             f'<span class="st">{esc(p["stat"])}'
             f'{_tier_badge(p.get("tier"), p.get("tier_edge"))}'
             f'{_odds_badge(p.get("odds_type"))}{badge}</span>'
-            f'<span class="num">{p["model"]:.1f}</span>'
+            f'{_fmt_model(p)}'
             f'<span class="num line">{p["line"]:.1f}</span>'
-            f'<span class="num diff {cls}">{p["diff"]:+.1f}</span>'
+            f'{_fmt_chance(p)}'
             f'<span class="lean {cls}">{esc(p["lean"])}</span>'
             f"</div>")
     head = ('<div class="gv-pl-head"><span class="st">Stat</span>'
             '<span class="num">Model</span><span class="num">Line</span>'
-            '<span class="num">Gap</span><span class="lean">Lean</span></div>')
+            '<span class="num">Chance</span><span class="lean">Lean</span></div>')
     return f'<div class="gv-pl">{head}{"".join(rows)}</div>'
 
 
@@ -393,6 +488,18 @@ def render_input(season: int, week: int) -> None:
     A bordered container, not an expander: Streamlit forbids nesting expanders
     inside popovers, and this renders inside one.
     """
+    if _read_only():
+        # Say it plainly rather than accepting a paste that will not survive.
+        # This deployment has no persistent disk, so the record is maintained
+        # in the repository and served here read-only.
+        st.info(
+            "This is the published board, and it does not accept pasted lines. "
+            "The lines and the accuracy record below are published with the "
+            "site, so they are the same for everyone and cannot be changed from "
+            "here. New weeks are added when the site is updated."
+        )
+        return
+
     with st.container(border=True):
         st.markdown("**Copy the PrizePicks board and paste it here**")
         st.markdown(
@@ -454,19 +561,37 @@ def render_week_record(season: int, weeks: list[int]) -> None:
         return
     reg = predict.load_registry()
     rows = []
+    oos: list = []
     for w in weeks:
         ln = props.load_lines(season, w)
         if ln is None or ln.empty:
             continue
-        proj = predict.project_week_cached(season, w)
-        table, _ = props.compare(ln, proj, reg)
+        # Prefer the FROZEN comparison: what the model said when the line was
+        # first seen. Recomputing scores an old board against a model retrained
+        # since, which makes the record improve every time the models are refit
+        # and is therefore not a record of anything. Weeks with no snapshot are
+        # still shown, labelled, rather than hidden.
+        frozen = props.load_frozen(season, w)
+        if frozen is not None and not frozen.empty:
+            table, basis = frozen, "frozen"
+        else:
+            proj = predict.project_week_cached(season, w)
+            table, _ = props.compare(ln, proj, reg)
+            basis = "recomputed"
+
         # Count what the board actually SHOWS, so this table reconciles with the
         # ledger above it and with the per-game card pills. Counting matches
         # instead would report a number the reader cannot find anywhere.
         table, hidden_rows = props.filter_pickable(table)
         act = _actuals_for(season, w)
-        card = (props.week_scorecard(props.grade(table, act))
-                if act is not None and not act.empty else {"n": 0})
+        graded = (props.grade(table, act)
+                  if act is not None and not act.empty else pd.DataFrame())
+        # Only OUT-OF-SAMPLE weeks count toward the season record. Grading a
+        # week inside the training window is the model marking its own
+        # homework, and folding it into a headline rate would inflate it.
+        if basis == "frozen" and not props.is_in_training_window(season, reg):
+            oos.append(graded)
+        card = props.week_scorecard(graded) if not graded.empty else {"n": 0}
         rows.append({
             "Week": w,
             "Lines": len(ln),
@@ -477,9 +602,32 @@ def render_week_record(season: int, weeks: list[int]) -> None:
             "Model MAE": card.get("mae") if card.get("decided") else SENTINEL,
             "Line MAE": card.get("line_mae") if card.get("decided") else SENTINEL,
             "In sample": "yes" if props.is_in_training_window(season, reg) else "no",
+            "Basis": basis,
         })
     if not rows:
         return
+    rec = props.season_record(oos)
+    if rec.get("decided"):
+        verdict = ("an edge, on this evidence" if rec["beats_coin"]
+                   else "not yet distinguishable from a coin")
+        st.markdown(
+            '<div class="gv-window"><span class="lab">Season record, '
+            'out of sample</span></div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="gv-note"><b>{rec["hits"]} of {rec["decided"]} '
+            f'({rec["hit_rate"]}%)</b>, 95% confidence interval '
+            f'{rec["ci_low"]}% to {rec["ci_high"]}%. A coin is 50%, so this is '
+            f'<b>{verdict}</b>. Graded against the projection frozen when each '
+            f'line was first seen, never a recomputed one.'
+            + (f' {rec["ties"]} line(s) landed exactly on the number and are '
+               'counted as neither.' if rec.get("ties") else "")
+            + '</div>', unsafe_allow_html=True)
+    elif oos:
+        st.markdown(
+            '<div class="gv-note">Boards are on file but no out-of-sample week '
+            'has been played and graded yet, so there is no record to show.'
+            '</div>', unsafe_allow_html=True)
+
     st.markdown(
         '<div class="gv-window"><span class="lab">Week by week</span>'
         '<span class="meta">fills in as boards are pasted and games are played'

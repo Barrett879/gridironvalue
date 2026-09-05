@@ -43,6 +43,18 @@ from __future__ import annotations
 KEYS = frozenset({
     "gsis_id", "player_display_name", "position", "position_group",
     "season", "week", "game_id", "team", "opponent_team",
+    # Bio source fields. `age` and `experience` are DERIVED from these and are
+    # the usable form; the raw fields are a date string and a year and are kept
+    # only so the derivation is reproducible from the table.
+    "birth_date", "rookie_season",
+    # Venue identity. A KEY, never a feature: fed to a model directly it would
+    # memorise venues, and `altitude_m` is the derived form that generalises.
+    # Kept so that derivation is reproducible from the table, same as birth_date.
+    "stadium_id",
+    # The NFL numeric game id. A KEY: it is only the join used to attach the
+    # officiating crew, which the officials feed publishes against this id
+    # rather than the nflverse one.
+    "old_game_id",
 })
 
 TARGETS = frozenset({
@@ -92,7 +104,34 @@ PREGAME = frozenset({
     # the chart before he appears on an injury report, and before the season
     # starts it is the only such signal at all.
     "depth_rank", "depth_rank_capped", "is_starter",
+    # Bio. Static or knowable years in advance, so unambiguously pregame. Age
+    # curves are steep in football (backs decline in their late twenties,
+    # receivers often break out in year three), and draft round is the one
+    # pedigree signal that exists for a player with no NFL history at all.
+    "age", "experience", "draft_round", "height", "weight",
+    # Venue and schedule: the football analog of park factors and day-versus-
+    # night. Known weeks ahead. `roof_type` and `surface` were carried as
+    # strings and silently dropped for being non-numeric, so until now the model
+    # did not know whether a game was indoors.
+    "roof_indoor", "is_turf", "altitude_m", "opp_rest_days", "rest_diff",
+    "is_primetime", "week_of_season",
+    # The officiating crew. Genuinely pregame, but ONLY from the officials
+    # feed: `schedules.referee` is 100% populated for completed seasons and
+    # 0% for the upcoming one, making it a postgame field like temp and wind.
+    # Carried as a NAME and never used as a feature directly; the feature
+    # layer turns it into the crew's prior-season tendencies.
+    "referee",
 })
+
+# NextGen Stats are SAME-GAME measurements. A receiver's average separation in
+# week 6 is measured during week 6's game, so these are outcomes exactly like
+# targets are, and they are usable only as lagged history. Filed here so the
+# feature builder must lag them and `safe_feature_columns` can never return one.
+SAME_GAME_NGS_PREFIX = "ngs_"
+
+# PFR advanced stats are SAME-GAME too: a receiver's drops in week 6 are
+# counted during week 6. Same treatment as NextGen, lagged or not used.
+SAME_GAME_PFR_PREFIX = "pfr_"
 
 # Looks pregame, is not. See the module docstring.
 POSTGAME_TRAP = frozenset({"temp", "wind"})
@@ -100,6 +139,11 @@ POSTGAME_TRAP = frozenset({"temp", "wind"})
 
 def _is_same_game_team(col: str) -> bool:
     return col.startswith(SAME_GAME_TEAM_PREFIXES) and col not in SAME_GAME_EXPOSURE
+
+
+def _is_same_game_ngs(col: str) -> bool:
+    return (col.startswith(SAME_GAME_NGS_PREFIX)
+            or col.startswith(SAME_GAME_PFR_PREFIX))
 
 
 def classify(col: str) -> str:
@@ -116,6 +160,8 @@ def classify(col: str) -> str:
     if col in POSTGAME_TRAP:
         return "postgame_trap"
     if col in SAME_GAME_EXPOSURE:
+        return "same_game_exposure"
+    if _is_same_game_ngs(col):
         return "same_game_exposure"
     if _is_same_game_team(col):
         return "same_game_team"

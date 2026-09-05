@@ -80,6 +80,13 @@ import pandas as pd
 
 from .cache import atomic_to_parquet, dc_path, json_load, json_save, logger
 
+
+def _uncertainty():
+    """Imported lazily so props.py keeps no import-time dependency on a built
+    artifact, and so the network-isolation test still sees a clean import graph."""
+    from . import uncertainty
+    return uncertainty
+
 VERSION = "v1"
 
 # ── PrizePicks stat_type -> our projection columns ───────────────────────────
@@ -104,6 +111,34 @@ STAT_MAP: dict[str, tuple[tuple[str, ...], float]] = {
     "rec yards": (("receiving_yards",), 1.0),
     "receptions": (("receptions",), 1.0),
     "targets": (("targets",), 1.0),
+    # PrizePicks' own board wording. These were silently unmapped and cost 109
+    # lines of stats the model is actually decent at: "Rec Targets" alone was
+    # 72 lines on the week 1 board, for a stat with a measured +1.8 edge.
+    "rec targets": (("targets",), 1.0),
+    "receiving targets": (("targets",), 1.0),
+    "rush+rec yds": (("rushing_yards", "receiving_yards"), 1.0),
+    "pass+rush yds": (("passing_yards", "rushing_yards"), 1.0),
+    "rec+rush yds": (("receiving_yards", "rushing_yards"), 1.0),
+    # Anytime touchdown. Routed to a PROBABILITY, never to a mean, and this is
+    # a correctness fix rather than a preference.
+    #
+    # A 0.5 touchdown line asks "does he score at least one", which is
+    # P(TD >= 1). E[TD] is a different quantity: it counts two-touchdown games
+    # twice, so it sits ABOVE P(>=1) for every player. On the 2026 week 1 board
+    # that gap flips the side for most of the players it flags: of 36 players
+    # with E[TD] > 0.5, twenty-six have P(>=1) BELOW 0.5. Ja'Marr Chase projects
+    # 0.69 expected touchdowns and a 50.0% chance of scoring one. Comparing the
+    # mean to the line would lean More on all 36 and be wrong-sided on 26.
+    #
+    # These 368 lines were the single largest block on the board and were
+    # invisible because the stat had no mapping. Showing them required the
+    # probability, not a rename.
+    "player touchdowns": (("__prob__", "rushing_tds", "receiving_tds"), 1.0),
+    "anytime td": (("__prob__", "rushing_tds", "receiving_tds"), 1.0),
+    "pass+rush+rec tds": (("__prob__", "rushing_tds", "receiving_tds"), 1.0),
+    "rush tds": (("__prob__", "rushing_tds"), 1.0),
+    "rec tds": (("__prob__", "receiving_tds"), 1.0),
+    "receiving tds": (("__prob__", "receiving_tds"), 1.0),
     # Combination props. Summing component means is exact for the mean.
     "rush+rec yards": (("rushing_yards", "receiving_yards"), 1.0),
     "rush + rec yards": (("rushing_yards", "receiving_yards"), 1.0),
@@ -488,17 +523,41 @@ def reliability_for(columns) -> dict:
 
 
 def rank_by_reliability(table: pd.DataFrame) -> pd.DataFrame:
-    """Sort a compared table by how much the lean is worth, then by gap size.
+    """Sort by how much the lean is worth, then by CONFIDENCE in it.
 
-    Tier first, gap second. Sorting by gap alone puts the least trustworthy
-    stats at the top of the board, which is the opposite of useful.
+    Tier first, because sorting by size alone puts the least trustworthy stats
+    at the top of the board, which is the opposite of useful.
+
+    Confidence second, NOT gap size. The gap was the secondary key until now and
+    it is the wrong quantity twice over: it is biased on right-skewed stats (a
+    big positive gap can still be under a coin flip), and it is not comparable
+    across stats, since seven yards and half a reception are different things
+    that sorted as 7.0 against 0.5. Distance of the probability from a coin flip
+    is scale-free and is what a reader is actually ranking by.
+
+    Rows with no fitted distribution fall back to the RELATIVE gap, which is at
+    least scale-free, rather than the raw one.
     """
     if table is None or table.empty or "tier" not in table.columns:
         return table
     out = table.copy()
     out["_tier_rank"] = out["tier"].map(
         lambda t: TIER_ORDER.get(str(t), 2)).fillna(2)
-    out["_gap"] = out["diff"].abs()
+    if "p_over" in out.columns:
+        conf = pd.to_numeric(out["p_over"], errors="coerce").sub(0.5).abs()
+    else:
+        conf = pd.Series(np.nan, index=out.index)
+    # A probability prop's own value IS a probability, so its confidence is its
+    # distance from a coin flip too.
+    if "kind" in out.columns:
+        is_prob = out["kind"] == "probability"
+        conf = conf.mask(is_prob,
+                         pd.to_numeric(out["model"], errors="coerce")
+                         .sub(0.5).abs())
+    fallback = (pd.to_numeric(out.get("diff_pct"), errors="coerce").abs() / 400.0
+                if "diff_pct" in out.columns
+                else pd.Series(0.0, index=out.index))
+    out["_gap"] = conf.fillna(fallback).fillna(0.0)
     return (out.sort_values(["_tier_rank", "_gap"], ascending=[True, False])
                .drop(columns=["_tier_rank", "_gap"])
                .reset_index(drop=True))
@@ -538,6 +597,16 @@ def lines_path(season: int, week: int):
 
 
 def save_lines(season: int, week: int, lines: pd.DataFrame) -> None:
+    """Persist a pasted board. A no-op on a read-only deployment.
+
+    Silently writing on a host without a disk is worse than not writing: the
+    board would show, then vanish on the next restart, and the deployed record
+    would quietly disagree with the committed one.
+    """
+    from .cache import READ_ONLY
+    if READ_ONLY:
+        logger.info("read-only deployment; not persisting pasted lines")
+        return
     payload = {
         "season": season, "week": week,
         "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -567,6 +636,105 @@ def saved_weeks(season: int) -> list[int]:
         if lines_path(season, w).exists():
             out.append(w)
     return out
+
+
+# ── Frozen projections: what the model ACTUALLY said, when it said it ───────
+# Without this the accuracy record is worthless, and worse than worthless
+# because it looks authoritative.
+#
+# `compare()` joins saved lines to projections computed RIGHT NOW. Grade a week
+# from three weeks ago and it is scored against today's model, which has since
+# been retrained on data that did not exist when the board was posted. The
+# record would show what a future model would have done. It would also silently
+# improve every time the models are retrained, which is exactly backwards: a
+# record that cannot get worse is not measuring anything.
+#
+# So the model's number is frozen the moment a line is first seen, and grading
+# reads the frozen value. FIRST SEEN WINS: re-pasting a board on Saturday must
+# not overwrite Wednesday's projection with one that has since absorbed three
+# days of injury news. New lines in that paste are frozen at their own time.
+FREEZE_KEYS = ["player", "stat", "line"]
+
+
+def snapshot_path(season: int, week: int):
+    return dc_path(f"pp_frozen_{season}_w{week:02d}_{VERSION}.json")
+
+
+def _freeze_key(row) -> str:
+    return "|".join(str(row.get(k)) for k in FREEZE_KEYS)
+
+
+def freeze_projections(season: int, week: int, table: pd.DataFrame,
+                       model_version: str | None = None) -> int:
+    """Record the model's number for every line not already frozen.
+
+    Returns how many NEW rows were frozen, so a caller can say so rather than
+    reporting silence. Safe to call repeatedly; it is a no-op for lines that
+    already have a frozen value.
+    """
+    from .cache import READ_ONLY
+    if READ_ONLY:
+        # The record is a committed artifact on a read-only host. Freezing here
+        # would stamp a snapshot with whatever model this container loaded and
+        # then lose it, which is exactly the drift freezing exists to prevent.
+        return 0
+    if table is None or table.empty:
+        return 0
+    keep = [c for c in ("player", "stat", "line", "model", "diff", "lean",
+                        "sides", "odds_type", "source", "tier", "position",
+                        "team", "opponent", "gsis_id", "game_id",
+                        "games_prior", "p_play",
+                        # The claimed probability and its units. Without these
+                        # the record can say whether the LEAN was right but not
+                        # whether the NUMBER was honest, and "we said 65%" is
+                        # only checkable if 65% was written down.
+                        "p_over", "kind") if c in table.columns]
+    path = snapshot_path(season, week)
+    existing = {}
+    if path.exists():
+        try:
+            payload = json_load(path)
+            existing = {r["_key"]: r for r in payload.get("rows", [])}
+        except Exception as e:  # noqa: BLE001
+            logger.warning("could not read snapshot %s: %s", path, e)
+
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    added = 0
+    for _, r in table[keep].iterrows():
+        k = _freeze_key(r)
+        if k in existing:
+            continue          # first seen wins
+        row = {c: (None if pd.isna(r[c]) else r[c]) for c in keep}
+        row["_key"] = k
+        row["frozen_at"] = now
+        row["model_version"] = model_version
+        existing[k] = row
+        added += 1
+
+    json_save(path, {"season": season, "week": week,
+                     "updated_at": now, "rows": list(existing.values())})
+    return added
+
+
+def load_frozen(season: int, week: int) -> pd.DataFrame | None:
+    """The frozen comparison for a week, or None if nothing was ever frozen."""
+    path = snapshot_path(season, week)
+    if not path.exists():
+        return None
+    try:
+        payload = json_load(path)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("could not read snapshot %s: %s", path, e)
+        return None
+    df = pd.DataFrame(payload.get("rows", []))
+    if df.empty:
+        return None
+    df.attrs["updated_at"] = payload.get("updated_at")
+    return df
+
+
+def frozen_weeks(season: int) -> list[int]:
+    return [w for w in range(1, 19) if snapshot_path(season, w).exists()]
 
 
 def route_to_weeks(lines: pd.DataFrame, games: pd.DataFrame,
@@ -616,6 +784,38 @@ def fetch_kickoffs(games: pd.DataFrame):
 
 
 # ── Matching lines to projections ────────────────────────────────────────────
+def poisson_at_least(lam: float, k: int) -> float:
+    """P(X >= k) for X ~ Poisson(lam). Touchdowns are the canonical count.
+
+    Poisson is the right family here and not merely a convenience: scoring
+    chances arrive as a stream of near-independent low-probability events, which
+    is exactly the generating story. It is imperfect (goal-line volume clusters,
+    so the true distribution is slightly over-dispersed), and over-dispersion
+    pushes P(>=1) DOWN for a given mean, so this is the optimistic side of the
+    error rather than the flattering one.
+    """
+    if lam is None or not np.isfinite(lam) or lam < 0:
+        return float("nan")
+    if k <= 0:
+        return 1.0
+    # P(X >= k) = 1 - sum_{i<k} pmf(i), summed forward to stay stable at small k.
+    term = np.exp(-lam)
+    cum = term
+    for i in range(1, k):
+        term *= lam / i
+        cum += term
+    return float(min(1.0, max(0.0, 1.0 - cum)))
+
+
+def threshold_for_line(line: float) -> int:
+    """How many touchdowns 'More' actually requires.
+
+    A 0.5 line needs 1, a 1.5 line needs 2. PrizePicks posts half points so the
+    outcome cannot land on the number.
+    """
+    return int(np.floor(float(line))) + 1
+
+
 def _resolve_stat(stat_type: str):
     """(columns, scale, note) for a stat, or (None, None, reason) if refused."""
     key = str(stat_type or "").strip().lower()
@@ -678,7 +878,25 @@ def compare(lines: pd.DataFrame, proj: pd.DataFrame,
             continue
         p = by_key.loc[key]
 
-        if cols == ("__fantasy__",):
+        line_val = float(ln["line"])
+        # Most props compare a projected MEAN to the posted number. Touchdowns
+        # compare a PROBABILITY to 0.5, because the question a 0.5 line asks is
+        # "at least one", not "how many on average". Carried as `kind` so the
+        # reader is never shown a probability formatted as a stat line.
+        kind, compare_to = "mean", line_val
+
+        if cols and cols[0] == "__prob__":
+            parts = [p.get(c) for c in cols[1:]]
+            lam = sum(float(v) for v in parts
+                      if v is not None and pd.notna(v))
+            if lam <= 0:
+                continue
+            model_val = poisson_at_least(lam, threshold_for_line(line_val))
+            kind, compare_to = "probability", 0.5
+            # Both components are served from a baseline; they lose the ship
+            # gate to a season-to-date mean. Labelled, never dressed up.
+            src = "baseline"
+        elif cols == ("__fantasy__",):
             model_val = float(p["_fantasy"])
             src = "composite"
         else:
@@ -697,16 +915,41 @@ def compare(lines: pd.DataFrame, proj: pd.DataFrame,
         elif src == "model_low_confidence":
             meta["low_confidence"] += 1
 
-        _rel = reliability_for(cols if cols != ("__fantasy__",) else ())
-        line_val = float(ln["line"])
-        diff = model_val - line_val
+        # A probability prop inherits the reliability of the stats behind it.
+        _rel = reliability_for(
+            tuple(cols[1:]) if cols and cols[0] == "__prob__"
+            else () if cols == ("__fantasy__",) else cols)
+        diff = model_val - compare_to
+        lean = "More" if diff > 0 else "Less" if diff < 0 else "Even"
+        # P(actual > line), from measured residual distributions. Only for
+        # single-stat MEAN props: a combination prop has no fitted ratio, and a
+        # probability prop already IS one.
+        p_over = float("nan")
+        if kind == "mean" and len(cols) == 1 and cols[0] not in ("__fantasy__",):
+            p_over = _uncertainty().prob_over(cols[0], model_val, line_val)
+        if kind == "mean" and np.isfinite(p_over):
+            # THE LEAN COMES FROM THE PROBABILITY, not the gap, wherever one
+            # exists. Measured on 2024: the gap rule leaned More on 66% of
+            # receiving-yards lines when only 41% went Over, because these
+            # stats are right-skewed and a line below the projected MEAN can
+            # still sit above the median. Switching the rule moves receiving
+            # yards from -5.4 to +3.0 and rushing yards from -7.7 to +2.3,
+            # while costing the near-symmetric QB props 0.7 to 1.5.
+            lean = "More" if p_over > 0.5 else "Less" if p_over < 0.5 else "Even"
         rows.append({
             "player": p["player_display_name"], "team": p["team"],
             "position": p["position"], "opponent": p.get("opponent_team"),
             "stat": ln.get("stat_type"), "line": line_val,
             "model": round(model_val, 2), "diff": round(diff, 2),
-            "diff_pct": round(100 * diff / line_val, 1) if line_val else None,
-            "lean": "More" if diff > 0 else "Less" if diff < 0 else "Even",
+            "kind": kind,
+            # A ratio against the line is meaningless for a probability, so it
+            # is reported in PERCENTAGE POINTS away from a coin flip instead.
+            "diff_pct": (round(100 * diff, 1) if kind == "probability"
+                         else round(100 * diff / line_val, 1) if line_val
+                         else None),
+            "lean": lean,
+            "p_over": (round(float(p_over), 4)
+                       if np.isfinite(p_over) else None),
             "sides": offered_sides(ln.get("direction"), ln.get("odds_type")),
             "odds_type": ln.get("odds_type", "standard"),
             "source": src,
@@ -812,6 +1055,55 @@ def is_in_training_window(season: int, registry: dict | None) -> bool:
         return False
     through = registry.get("trained_through")
     return through is not None and season <= int(through)
+
+
+def wilson_interval(hits: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """95% confidence interval for a hit rate, Wilson score.
+
+    Wilson rather than the normal approximation because the samples here are
+    small and the rate sits near 0.5 where the normal interval is at its worst,
+    and because Wilson does not produce impossible bounds outside [0, 1].
+    """
+    if n <= 0:
+        return (float("nan"), float("nan"))
+    p = hits / n
+    d = 1 + z * z / n
+    centre = (p + z * z / (2 * n)) / d
+    half = z * ((p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5) / d
+    return (max(0.0, centre - half), min(1.0, centre + half))
+
+
+def season_record(graded_weeks: list[pd.DataFrame]) -> dict:
+    """Aggregate record across weeks, with an interval and a verdict.
+
+    THE INTERVAL IS THE POINT. A prop board grades a few hundred lines a season,
+    and at n=300 the 95% interval on a hit rate is roughly plus or minus 5.7
+    points. So 53% and 47% are the same measurement, and a bare percentage
+    invites reading a coin flip as an edge. Reporting the interval, and refusing
+    to call anything an edge until the lower bound clears 50, is the difference
+    between a record and a story.
+    """
+    frames = [g for g in graded_weeks if g is not None and not g.empty]
+    if not frames:
+        return {"n": 0, "decided": 0}
+    allg = pd.concat(frames, ignore_index=True)
+    decided = allg[allg["model_correct"].notna()]
+    n = int(len(decided))
+    if n == 0:
+        return {"n": int(len(allg)), "decided": 0}
+    hits = int(decided["model_correct"].sum())
+    lo, hi = wilson_interval(hits, n)
+    return {
+        "n": int(len(allg)),
+        "decided": n,
+        "hits": hits,
+        "hit_rate": round(100 * hits / n, 1),
+        "ci_low": round(100 * lo, 1),
+        "ci_high": round(100 * hi, 1),
+        # A coin is 50. An edge exists only if the LOWER bound clears it.
+        "beats_coin": bool(lo > 0.5),
+        "ties": int(allg["model_correct"].isna().sum()),
+    }
 
 
 def week_scorecard(graded: pd.DataFrame) -> dict:

@@ -407,3 +407,97 @@ def test_depth_rank_is_capped_identically_on_both_sides():
     capped = pd.to_numeric(raw, errors="coerce").clip(upper=3)
     assert list(capped.dropna()) == [1.0, 2.0, 3.0, 3.0, 3.0]
     assert bool((capped == 1).iloc[0])
+
+
+# ── Venue block: a constant column is a broken join ──────────────────────────
+# `altitude_m` shipped as all zeros because `stadium_id` was missing from the
+# schedule merge and a defensive `if "stadium_id" in df.columns` guard turned
+# that into a plausible constant. A feature that is constant carries no
+# information, so the model cannot tell you it broke: the ablation just reports
+# "no effect" and the block gets rejected for the wrong reason.
+def test_venue_columns_are_not_constant(table):
+    """Every venue column must actually vary. A constant one means a dead join."""
+    for col in ("roof_indoor", "is_turf", "altitude_m", "rest_diff",
+                "is_primetime", "week_of_season"):
+        if col not in table.columns:
+            pytest.skip(f"{col} not built yet")
+        n = pd.to_numeric(table[col], errors="coerce").nunique(dropna=True)
+        assert n > 1, (
+            f"{col} is constant across all {len(table)} rows. A venue feature "
+            "that never varies is a broken join, not a real constant."
+        )
+
+
+def test_altitude_is_set_for_denver_and_only_the_high_venues(table):
+    """Denver hosts games every season, so zero high-altitude rows is a bug."""
+    if "altitude_m" not in table.columns or "stadium_id" not in table.columns:
+        pytest.skip("venue block not built yet")
+    high = table[table["altitude_m"] > 0]
+    assert len(high) > 0, "no high-altitude rows at all; the stadium join broke"
+    assert set(high["stadium_id"].unique()) <= {"DEN00", "MEX00"}
+    # Every Denver home game must be flagged, not merely some of them.
+    den = table[table["stadium_id"] == "DEN00"]
+    assert (den["altitude_m"] == 1610.0).all()
+
+
+def test_surface_whitespace_does_not_flip_grass_to_turf(table):
+    """The feed carries both 'grass' and 'grass '; both are grass."""
+    if "is_turf" not in table.columns:
+        pytest.skip("venue block not built yet")
+    surf = table["surface"].astype(str).str.lower().str.strip()
+    assert (table.loc[surf == "grass", "is_turf"] == 0.0).all(), (
+        "a grass game is flagged as turf; suspect an unstripped surface string"
+    )
+
+
+# ── Per-target feature sets: the third instance of train/serve skew ──────────
+# Targets no longer share one feature list. Positional defence ships for skill
+# positions and is excluded from every QB passing target, so a registry that
+# records one global list, or a serving path that builds one shared X, would
+# feed the QB models four columns they were never fitted on. That is a silent
+# wrong answer, not an error, and it is the same shape as the two skews that
+# already cost this project a regression each.
+def _registry():
+    import json
+    from gridlib.predict import MODELS_DIR
+    p = MODELS_DIR / "registry_m1.json"
+    if not p.exists():
+        pytest.skip("models not trained")
+    return json.loads(p.read_text())
+
+
+def test_registry_records_feature_columns_per_target():
+    reg = _registry()
+    for target, meta in reg["targets"].items():
+        assert "feature_columns" in meta, (
+            f"{target} has no per-target feature list; serving would fall back "
+            "to the union and feed it columns it was never fitted on"
+        )
+        assert meta["feature_columns"], f"{target} has an empty feature list"
+
+
+def test_qb_passing_models_were_fitted_without_positional_defence():
+    """DVP describes skill-position and QB RUSHING outcomes, never passing."""
+    from gridlib import features as F
+    if not F.USE_POSITIONAL_DEF or not F.USE_POSDEF_EXCLUDE:
+        pytest.skip("positional defence or its exclusion is off")
+    reg = _registry()
+    for target in F.POSDEF_EXCLUDE_TARGETS:
+        meta = reg["targets"].get(target)
+        if meta is None:
+            continue
+        dvp = [c for c in meta["feature_columns"]
+               if c.startswith(F.DVP_PREFIX)]
+        assert not dvp, f"{target} was fitted WITH {dvp}, which was excluded"
+
+
+def test_every_trained_column_is_a_subset_of_the_union():
+    """The union is what the inference completeness check is run against."""
+    reg = _registry()
+    union = set(reg["feature_columns"])
+    for target, meta in reg["targets"].items():
+        extra = set(meta.get("feature_columns", [])) - union
+        assert not extra, (
+            f"{target} was fitted on {sorted(extra)[:4]}, absent from the union, "
+            "so the inference check would not verify they exist"
+        )

@@ -223,6 +223,29 @@ def build_inference_rows(season: int, week: int,
             "healthy baseline. Before the season starts the DEPTH CHART is the "
             "only availability signal, which is why rank is a feature.",
             season, week)
+    # ── Bio, derived EXACTLY as the backfill derives it ──
+    # Same trap as the injury block above, and it was live: bio shipped into
+    # the feature set and this path was never taught to build it, so every
+    # projection would have carried NaN age, experience, draft round, height
+    # and weight. A tree routes NaN down a learned branch and returns a
+    # confident wrong number instead of failing. Caught by
+    # test_predict_refuses_to_serve_with_missing_features once the models were
+    # retrained; the test could not see it before, because the artifacts then
+    # in `models/` predated the bio block.
+    bio = fetch.player_bio()
+    if not bio.empty:
+        out = out.merge(bio, on="gsis_id", how="left")
+        out["experience"] = (out["season"] - pd.to_numeric(
+            out.get("rookie_season"), errors="coerce")).clip(lower=0)
+        out["draft_round"] = pd.to_numeric(
+            out.get("draft_round"), errors="coerce").fillna(8.0)
+        _born = pd.to_datetime(out.get("birth_date"), errors="coerce")
+        _gd = pd.to_datetime(out.get("gameday"), errors="coerce")
+        out["age"] = (_gd - _born).dt.days / 365.25
+    else:
+        for c in ("age", "experience", "draft_round", "height", "weight"):
+            out[c] = np.nan
+
     _SEV = {"Questionable": 1.0, "Doubtful": 2.0, "Out": 3.0}
     _PRAC = {"Full Participation in Practice": 0.0,
              "Limited Participation in Practice": 1.0,
@@ -314,7 +337,11 @@ def project_week(season: int, week: int,
             f"them. Fix build_inference_rows rather than filling with NaN."
         )
 
-    X = live[cols]
+    # NO shared X. Each model gets the exact column list it was fitted on,
+    # because targets no longer share one feature set: the QB models are
+    # trained without the positional-defence block. Handing every model the
+    # union would feed the QB models four columns they never saw, in the wrong
+    # positions, which is a silent wrong answer rather than an error.
     for target, meta in reg["targets"].items():
         live[f"{target}_source"] = meta["present_as"]
         if meta["present_as"] == "baseline":
@@ -333,7 +360,23 @@ def project_week(season: int, week: int,
             live[target] = np.nan
             continue
         mdl = joblib.load(path)
-        pred = np.clip(mdl.predict(X), 0, None)
+        # Fall back to the union for a registry written before per-target
+        # columns existed; those artifacts were fitted on the union.
+        mcols = meta.get("feature_columns") or cols
+        missing_t = [c for c in mcols if c not in live.columns]
+        if missing_t:
+            raise RuntimeError(
+                f"{target}: {len(missing_t)} trained feature column(s) missing "
+                f"at inference: {missing_t[:8]}."
+            )
+        pred = np.clip(mdl.predict(live[mcols]), 0, None)
+        # Measured LEVEL correction, for the three targets where one survived
+        # the two-stage gate. The lowest projection quintile is over-projected
+        # by 10-25% because it is mostly zeros and nothing separates a receiver
+        # who dressed and was never targeted from one who saw a little work.
+        # Monotone, so it cannot reorder players. A no-op for every other target.
+        from . import uncertainty as _u
+        pred = _u.apply_level(target, pred)
         # A model only applies to the positions it was trained on.
         applies = live["position"].isin(meta["positions"]).to_numpy()
         live[target] = np.where(applies, pred, np.nan)

@@ -113,7 +113,9 @@ def _metrics(y: np.ndarray, p: np.ndarray) -> dict[str, float]:
 def evaluate_target(feat: pd.DataFrame, target: str, spec, fold_season: int,
                     train_max: int) -> dict | None:
     positions, kind, exposure = spec
-    cols = F.feature_columns(feat)
+    # Per target: the QB models ship without the positional-defence block, so
+    # selecting once for every target would validate a config that is not served.
+    cols = F.feature_columns(feat, target)
 
     sub = feat[feat["position"].isin(positions) & feat[target].notna()]
     tr = sub[sub["season"] <= train_max]

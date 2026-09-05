@@ -53,7 +53,6 @@ def main() -> None:
     lg = read_parquet_or_none(dc_path("league_season_2016_2025_v1.parquet"))
     priors = F.league_priors(pw, TEST)
     feat = F.build(pw[pw["season"] <= TEST], lg, priors)
-    cols = F.feature_columns(feat)
 
     print(f"\nSide-picking accuracy, train <= {TRAIN_END}, scored on {TEST}")
     print("Line PROXIED by the player's season-to-date mean, set to the nearest")
@@ -67,6 +66,10 @@ def main() -> None:
         te = sub[sub["season"] == TEST].copy()
         if len(tr) < 500 or len(te) < 200:
             continue
+        # Per target, matching what ships: the QB models are trained without
+        # the positional-defence block. Selecting once for every target would
+        # measure a configuration that is not the one being served.
+        cols = F.feature_columns(feat, target)
         mdl = HistGradientBoostingRegressor(loss=loss, **PARAMS)
         mdl.fit(tr[cols], tr[target].astype(float))
         te["pred"] = np.clip(mdl.predict(te[cols]), 0, None)

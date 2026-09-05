@@ -216,6 +216,119 @@ def load_participation(season: int, ttl: int = 24 * 3600):
     )
 
 
+# ── NextGen Stats: the tracking-derived layer ────────────────────────────────
+# The closest football analog to Statcast quality-of-contact. One file per
+# discipline, ALL seasons in each, 2016+. Weekly rows carry week > 0; week == 0
+# is the season aggregate and must be filtered out or it double-counts.
+#
+# COVERAGE IS THE CATCH. These are QUALIFIED players only: about 73 receivers,
+# 30 rushers and 30 passers per week across 32 teams. So an NGS feature is
+# present for the players who carry prop lines and absent for most of a depth
+# chart. That is usable but it means the block must be judged on whether it
+# helps the covered rows, not on pooled error over rows where it is missing.
+_NGS_KINDS = ("receiving", "rushing", "passing")
+
+
+def load_nextgen(kind: str, ttl: int = 24 * 3600):
+    """Weekly NextGen Stats for one discipline. None if unavailable."""
+    if kind not in _NGS_KINDS:
+        raise ValueError(f"kind must be one of {_NGS_KINDS}, got {kind!r}")
+    df = load_release("nextgen_stats", f"ngs_{kind}.parquet",
+                      f"ngs_{kind}.parquet", ttl=ttl)
+    if df is None or df.empty:
+        return None
+    out = df
+    if "season_type" in out.columns:
+        out = out[out["season_type"] == "REG"]
+    if "week" in out.columns:
+        out = out[out["week"] > 0]      # drop the season-aggregate rows
+    return out.reset_index(drop=True)
+
+
+_PFR_KINDS = ("pass", "rush", "rec", "def")
+
+
+def load_pfr_advstats(kind: str, season: int, ttl: int = 24 * 3600):
+    """Weekly Pro-Football-Reference advanced stats for one discipline.
+
+    Broken tackles and drops: the two things the box score cannot see and that
+    every scout tracks. Nothing here scrapes PFR. These are nflverse's MIRRORED
+    release parquets, which is the whole reason they are usable at all, because
+    PFR itself sits behind bot verification that this project does not work
+    around.
+
+    One file PER SEASON, unlike NextGen's single all-seasons file, and coverage
+    starts in 2018. Returns None for a season that was never published.
+    """
+    if kind not in _PFR_KINDS:
+        raise ValueError(f"kind must be one of {_PFR_KINDS}, got {kind!r}")
+    df = load_release("pfr_advstats", f"advstats_week_{kind}_{season}.parquet",
+                      f"pfr_adv_{kind}_{season}.parquet", ttl=ttl)
+    if df is None or df.empty:
+        return None
+    out = df
+    if "game_type" in out.columns:
+        out = out[out["game_type"] == "REG"]
+    return out.reset_index(drop=True)
+
+
+def load_officials(ttl: int = 24 * 3600):
+    """Officiating crew per game, keyed by the NUMERIC game id.
+
+    Joins to the schedule on `old_game_id`, NOT `game_id`: this file uses the
+    NFL's numeric id (2026090900) while the schedule uses the nflverse string
+    (2026_01_NE_SEA). Joining on `game_id` silently matches nothing, which looks
+    exactly like an unpublished file.
+
+    Unlike participation, crews are announced BEFORE kickoff, so this is
+    genuinely pregame information rather than training-only.
+    """
+    df = load_release("officials", "officials.parquet", "officials.parquet",
+                      ttl=ttl)
+    if df is None or df.empty:
+        return None
+    out = df
+    if "season_type" in out.columns:
+        out = out[out["season_type"] == "REG"]
+    return out.reset_index(drop=True)
+
+
+def referee_by_game(ttl: int = 24 * 3600) -> pd.DataFrame:
+    """One row per game: the REFEREE, who is the crew chief and the name the
+    crew's tendencies are attributed to. The file also lists umpires, line
+    judges and a long tail of alternates; only the referee is a stable label."""
+    off = load_officials(ttl=ttl)
+    if off is None:
+        return pd.DataFrame(columns=["old_game_id", "referee"])
+    ref = off[off["position"].astype(str) == "Referee"]
+    ref = ref.dropna(subset=["game_id", "official_name"])
+    out = (ref[["game_id", "official_name"]]
+           .drop_duplicates("game_id")
+           .rename(columns={"game_id": "old_game_id",
+                            "official_name": "referee"}))
+    out["old_game_id"] = out["old_game_id"].astype(str)
+    return out.reset_index(drop=True)
+
+
+def player_bio() -> pd.DataFrame:
+    """gsis_id -> birth_date, draft position, rookie season, size.
+
+    Age is the single largest gap against a comparable baseball feature set, and
+    it matters more in football than in baseball because the curves are steeper:
+    running backs decline sharply in their late twenties and receivers commonly
+    break out in year three. `players.parquet` has carried this the whole time
+    and nothing used it.
+    """
+    pl = load_players()
+    if pl is None or pl.empty:
+        logger.warning("players.parquet unavailable; no bio features")
+        return pd.DataFrame(columns=["gsis_id"])
+    want = ["gsis_id", "birth_date", "draft_number", "draft_round",
+            "rookie_season", "height", "weight", "entry_year"]
+    have = [c for c in want if c in pl.columns]
+    return pl[have].dropna(subset=["gsis_id"]).drop_duplicates("gsis_id")
+
+
 def load_players(ttl: int = 24 * 3600):
     """The player master table: gsis_id, name, position, birthdate, ids."""
     return load_release("players", "players.parquet", "players.parquet", ttl=ttl)

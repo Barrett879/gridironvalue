@@ -1,17 +1,17 @@
 stat,tier,side_edge_pts,mae_pct,within20_pct,measured_on,note
-attempts,strong,10.1,20,62,2024 walk-forward,"the single best thing this model does; picks the right side 69.6% against a 59.5% coin bar"
-passing_yards,strong,8.6,25,53,2024 walk-forward,"the one yards stat with a real edge, because QB volume drives it more than efficiency does"
-completions,strong,8.1,22,55,2024 walk-forward,"tracks attempts closely"
-receptions,moderate,3.1,46,25,2024 walk-forward,"beats a naive line on the largest sample measured; the strategy doc ranks this a five-star anchor and the data agrees"
-targets,weak,0.8,41,29,2024 walk-forward,"inside the noise band against a naive line"
-carries,weak,-0.1,37,32,2024 walk-forward,"no measurable edge; also the one target the depth-rank block failed to improve"
-receiving_tds,none,-0.3,142,0,2024 walk-forward,"86.1% hit rate with NO edge: TD props resolve Under most of the time, so a high rate means nothing. Served from a baseline, not the model"
-rushing_tds,none,,,,not measured,"same family as receiving TDs and failed the ship gate; served from a baseline"
-passing_tds,weak,,60,11,2024 walk-forward,"side-picking not measured; central accuracy is poor"
-receiving_yards,negative,-5.7,56,20,2024 walk-forward,"picks sides WORSE than always taking the more common side. Yards are volume times efficiency and the efficiency half is noise"
-rushing_yards,negative,-9.4,51,23,2024 walk-forward,"the worst measured. Do not read a rushing-yards lean as information"
-passing_interceptions,weak,,,,not measured,"barely cleared its ship gate on MAE (+1.8%)"
-sacks_suffered,weak,,,,not measured,"cleared its ship gate but the margin is small"
+attempts,strong,10.4,20,62,"2024 walk-forward (probability rule, level + 4-season calibration)",the single best thing this model does; picks the right side 67.9% against a 57.0% coin bar
+completions,strong,7.8,22,55,"2024 walk-forward (probability rule, level + 4-season calibration)",tracks attempts closely
+passing_yards,strong,9.0,25,53,"2024 walk-forward (probability rule, level + 4-season calibration)","QB volume drives it more than efficiency does, so it survives where other yards props struggled"
+targets,moderate,5.1,41,29,"2024 walk-forward (probability rule, level + 4-season calibration)",improved from +1.8 when the lean moved from the gap to P(Over)
+receptions,moderate,5.2,46,25,"2024 walk-forward (probability rule, level + 4-season calibration)",improved from +2.3 under the probability rule; the strategy doc ranks this a five-star anchor and the data now agrees more strongly
+carries,moderate,4.2,37,32,"2024 walk-forward (probability rule, level + 4-season calibration)",improved from +1.6; the first reading where RB rush attempts clears a moderate bar
+receiving_yards,weak,2.6,56,20,"2024 walk-forward (probability rule, level + 4-season calibration)","WAS -5.4 under the gap rule. Receiving yards are right-skewed, so a line below the projected MEAN can still sit above the median and the gap rule leaned More on 66% of lines when only 41% went Over. Picking by P(Over) repairs it"
+rushing_yards,weak,1.8,51,23,"2024 walk-forward (probability rule, level + 4-season calibration)","WAS -7.7 under the gap rule, the worst on the board. Same skew mechanism as receiving yards; still the weakest of the repaired props"
+receiving_tds,none,-0.2,142,0,2024 walk-forward,"86.2% hit rate with NO edge: TD props resolve Under most of the time, so a high rate means nothing. Served from a baseline and priced as P(TD>=1), never as a mean"
+rushing_tds,none,,,,not measured,"same family as receiving TDs and failed the ship gate; served from a baseline, priced as a probability"
+passing_tds,weak,,60,11,2024 walk-forward,side-picking not measured; central accuracy is poor
+passing_interceptions,weak,,,,not measured,barely cleared its ship gate on MAE (+1.8%)
+sacks_suffered,weak,,,,not measured,cleared its ship gate but the margin is small
 fg_att,none,,,,not measured,"beats the player baselines but LOSES to a league constant; field-goal volume depends on where drives stall, not on the kicker"
-fg_made,none,,,,not measured,"same as fg_att"
+fg_made,none,,,,not measured,same as fg_att
 pat_att,weak,,,,not measured,"follows team touchdowns, so it inherits the touchdown problem"
