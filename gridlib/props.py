@@ -234,6 +234,14 @@ def parse_prizepicks_json(raw) -> pd.DataFrame:
         raw = json.loads(raw)
     data = raw.get("data", []) if isinstance(raw, dict) else []
     included = raw.get("included", []) if isinstance(raw, dict) else []
+    # This is a PASTE BOX: the input is whatever a visitor typed, not a feed.
+    # `{"data": ["x"]}` is valid JSON whose data[] holds a string, and calling
+    # .get on it raised AttributeError, which parse_any did not catch, which
+    # replaced the entire page with a traceback carrying server paths. The
+    # shape has to be checked rather than assumed.
+    data = [d for d in data if isinstance(d, dict)] if isinstance(data, list) else []
+    included = ([i for i in included if isinstance(i, dict)]
+                if isinstance(included, list) else [])
 
     players: dict[str, tuple] = {}
     for inc in included:
@@ -366,9 +374,21 @@ def parse_any(text: str) -> pd.DataFrame:
     if t.startswith("{") or t.startswith("["):
         try:
             return parse_prizepicks_json(t)
-        except (json.JSONDecodeError, TypeError, ValueError) as e:
-            logger.warning("JSON parse failed (%s); trying board text", e)
-    return parse_prizepicks_board(t)
+        except Exception as e:
+            # Deliberately broad. Everything downstream of here is untrusted
+            # paste, this function's contract is "return what you could parse",
+            # and the caller runs BEFORE the page renders, so anything that
+            # escapes takes the whole board down and prints server paths with
+            # it. A named-exception list is a promise about input we do not
+            # control; listing four of them is how AttributeError got out.
+            logger.warning("JSON parse failed (%s: %s); trying board text",
+                           type(e).__name__, e)
+    try:
+        return parse_prizepicks_board(t)
+    except Exception as e:
+        logger.warning("board-text parse failed (%s: %s); returning nothing",
+                       type(e).__name__, e)
+        return pd.DataFrame()
 
 
 def collapse_alt_lines(df: pd.DataFrame) -> pd.DataFrame:
@@ -617,16 +637,33 @@ def lines_path(season: int, week: int):
 
 
 def save_lines(season: int, week: int, lines: pd.DataFrame) -> None:
-    """Persist a pasted board.
+    """Persist a pasted board. Refuses on the published deployment.
 
-    This writes even on a host with no persistent disk, where the file lives
-    only until the next restart. That is deliberate and it is what DiamondValue
-    does: a temporary board is still worth showing, and losing it later costs
-    nothing that was not already going to be re-pasted.
+    Writing on a host with no persistent disk is fine and deliberate: the file
+    lives until the next restart, a temporary board is still worth showing, and
+    losing it costs nothing that was not going to be re-pasted anyway.
 
-    What must NOT happen on such a host is freezing, which is guarded in
-    `freeze_projections`. The board is a view; the record is evidence.
+    READ_ONLY is a different situation and the distinction is the whole point.
+    It marks the SHARED published site, where Streamlit Community Cloud has no
+    /data and CACHE_DIR falls back to the repo checkout, so this wrote into the
+    committed `pp_lines_*.json` that one server process serves to everybody. A
+    visitor's paste merged into the board every other visitor was reading.
+    Verified before the guard: a one-row paste took the committed week-1 file
+    from 259181 bytes to 246.
+
+    Pasting still works there; `props_ui` keeps it in the visitor's own session
+    instead. This guard is the backstop, so a future call site cannot reopen
+    the hole by going straight to the primitive.
+
+    What must ALSO not happen is freezing, guarded in `freeze_projections`.
+    The board is a view; the record is evidence.
     """
+    from .cache import READ_ONLY
+    if READ_ONLY:
+        logger.info(
+            "read-only deployment: not writing the shared board for %s w%s. "
+            "The paste is kept in the visitor's session instead.", season, week)
+        return
     payload = {
         "season": season, "week": week,
         "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),

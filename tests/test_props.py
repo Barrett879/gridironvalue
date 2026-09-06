@@ -998,15 +998,35 @@ def test_shrink_is_actually_applied():
 
 # ── Read-only deployments must not write the record ─────────────────────────
 def test_readonly_still_accepts_a_pasted_board(tmp_path, monkeypatch):
-    """Pasting IS allowed on a host with no disk. The board is a view: it shows
-    for a while and clears on restart, which is what DiamondValue does and is
-    fine. Only the RECORD is protected."""
+    """Pasting IS allowed on the published site. It just may not go to disk.
+
+    This test used to assert the paste landed in `load_lines`, on the reading
+    that READ_ONLY meant "a host with no persistent disk" where a file that
+    dies at restart harms nobody. That reading was wrong in one specific way:
+    READ_ONLY marks the SHARED site, Streamlit Community Cloud has no /data so
+    CACHE_DIR falls back to the repo checkout, and `pp_lines_*.json` is
+    COMMITTED there. One visitor's paste was merging into the board every other
+    visitor read. So the board stays a view and the record stays evidence, but
+    the view is now per visitor rather than global.
+    """
     import gridlib.cache as C
+
+    import props_ui
     monkeypatch.setattr(props, "dc_path", lambda name: tmp_path / name)
     monkeypatch.setattr(C, "READ_ONLY", True)
-    props.save_lines(2026, 4, pd.DataFrame([{"name": "x", "stat_type": "Pass Yards",
-                                             "line": 1.0}]))
-    assert props.load_lines(2026, 4) is not None
+    batch = pd.DataFrame([{"name": "x", "stat_type": "Pass Yards", "line": 1.0}])
+
+    props.save_lines(2026, 4, batch)
+    assert props.load_lines(2026, 4) is None, (
+        "a paste reached shared disk on the published deployment"
+    )
+
+    # ...and the visitor still sees their own board.
+    props_ui._remember_session_board(2026, 4, batch)
+    shown = props_ui._lines(2026, 4)
+    assert shown is not None and len(shown) == 1, (
+        "the paste box accepted a board and then showed nothing"
+    )
 
 
 def test_readonly_refuses_to_freeze(tmp_path, monkeypatch):
@@ -1206,3 +1226,68 @@ def test_count_props_are_priced_as_probabilities():
     for stat in ("Pass TDs", "INT", "FG Made"):
         cols, _s, _r = props._resolve_stat(stat)
         assert cols and cols[0] == "__prob__", f"{stat} is still priced as a mean"
+
+
+def test_hostile_paste_never_raises():
+    """The paste box takes whatever a visitor types, and it is read BEFORE the
+    page renders.
+
+    `parse_prizepicks_json` assumed `data[]` and `included[]` held dicts.
+    `{"data": ["x"]}` is valid JSON whose data[] holds a string, so `.get` on it
+    raised AttributeError, which `parse_any` did not catch, which replaced the
+    whole page with a traceback carrying absolute server paths (and
+    showErrorDetails is on). The session was then unrecoverable: the paste stays
+    in session_state and is re-parsed on every rerun, but the text area it lives
+    in no longer renders.
+    """
+    import json
+    import logging
+
+    from gridlib import props
+
+    logging.disable(logging.CRITICAL)
+    try:
+        atoms = ["x", 1, 1.5, None, True, [], {}, [1], {"a": 1},
+                 {"type": "new_player"}, {"attributes": None},
+                 {"attributes": "x"}, {"id": None}, {"relationships": "x"},
+                 {"relationships": {"new_player": "x"}},
+                 {"relationships": {"new_player": {"data": "x"}}}]
+        cases = []
+        for a in atoms:
+            for key in ("data", "included"):
+                cases.append(json.dumps({key: a}))
+                cases.append(json.dumps({key: [a]}))
+                cases.append(json.dumps({key: [a], "included": [a]}))
+        cases += ["", " ", "{}", "[]", "null", "true", '"s"',
+                  '{"data":[[[[]]]]}', '[{"a":1}]', '{"data":{"a":[1]}}',
+                  "abcdefghijklmno", "Player Name 12.5 Points", "x" * 5000]
+        for c in cases:
+            got = props.parse_any(c)          # must not raise, ever
+            assert got is not None
+    finally:
+        logging.disable(logging.NOTSET)
+
+
+def test_save_lines_refuses_on_the_published_deployment(monkeypatch):
+    """READ_ONLY marks the SHARED site, where a write lands on the committed
+    board one process serves to everybody.
+
+    Streamlit Community Cloud has no /data, so CACHE_DIR falls back to the repo
+    checkout and `cache/pp_lines_*.json` is a committed file. Before the guard a
+    one-row visitor paste took the committed week-1 board from 259181 bytes to
+    246. Pasting still works on that site; props_ui keeps it in the visitor's
+    own session.
+    """
+    import pandas as pd
+
+    from gridlib import cache, props
+
+    monkeypatch.setattr(cache, "READ_ONLY", True)
+    path = props.lines_path(2026, 1)
+    before = path.read_bytes() if path.exists() else None
+    props.save_lines(2026, 1, pd.DataFrame(
+        [{"player": "X", "stat": "points", "line_score": 1.0}]))
+    after = path.read_bytes() if path.exists() else None
+    assert after == before, (
+        "save_lines wrote to the shared committed board under READ_ONLY"
+    )

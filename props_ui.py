@@ -30,6 +30,46 @@ def _read_only() -> bool:
     return READ_ONLY
 
 
+# Where a visitor's own paste lives on the published site. On Streamlit
+# Community Cloud there is no /data, so CACHE_DIR falls back to the repo
+# checkout, and one shared server process serves every visitor from it. Writing
+# a paste to disk there merged it into the COMMITTED board that everybody else
+# was reading. The paste box still works and the notice already describes what
+# should happen ("it will show for a while, then clear when the site
+# restarts"); this makes that true by keeping it in the visitor's own session.
+_SESSION_LINES = "pp_session_lines"
+
+
+def _session_board(season: int, week: int) -> pd.DataFrame | None:
+    """Lines this visitor pasted, on the read-only deployment. Never shared."""
+    recs = (st.session_state.get(_SESSION_LINES) or {}).get(f"{season}_{week}")
+    return pd.DataFrame(recs) if recs else None
+
+
+def _remember_session_board(season: int, week: int, df: pd.DataFrame) -> None:
+    store = dict(st.session_state.get(_SESSION_LINES) or {})
+    store[f"{season}_{week}"] = df.to_dict(orient="records")
+    st.session_state[_SESSION_LINES] = store
+
+
+def _lines(season: int, week: int) -> pd.DataFrame | None:
+    """The board to DISPLAY: what shipped, plus whatever this visitor pasted.
+
+    Use this everywhere a board is SHOWN. Do not use it for the accuracy
+    record, which reads `props.load_lines` directly: the record is evidence and
+    must be identical for everyone, so a visitor's paste may reach the board in
+    front of them and must never reach the ledger behind it.
+    """
+    saved = props.load_lines(season, week)
+    mine = _session_board(season, week) if _read_only() else None
+    if mine is None or mine.empty:
+        return saved
+    if saved is None or saved.empty:
+        return mine
+    return props.collapse_alt_lines(
+        pd.concat([saved, mine], ignore_index=True))
+
+
 def resolve_and_persist(season: int, week: int, games: pd.DataFrame | None = None):
     """Merge any freshly-pasted text into the saved set and persist it.
 
@@ -62,6 +102,15 @@ def resolve_and_persist(season: int, week: int, games: pd.DataFrame | None = Non
                 routed = {week: got}
             for wk, batch in routed.items():
                 dest = week if wk == "_unrouted" else int(wk)
+                if _read_only():
+                    # Session-scoped, and no freeze. The published board and
+                    # the record it is judged by both ship with the site.
+                    mine = _session_board(season, dest)
+                    merged = (pd.concat([mine, batch], ignore_index=True)
+                              if mine is not None else batch)
+                    _remember_session_board(
+                        season, dest, props.collapse_alt_lines(merged))
+                    continue
                 existing = props.load_lines(season, dest)
                 merged = (pd.concat([existing, batch], ignore_index=True)
                           if existing is not None else batch)
@@ -76,7 +125,7 @@ def resolve_and_persist(season: int, week: int, games: pd.DataFrame | None = Non
                          if w != "_unrouted" and int(w) != week}
             st.session_state["pp_routed_elsewhere"] = elsewhere
     st.session_state["pp_parse_note"] = note
-    return props.load_lines(season, week)
+    return _lines(season, week)
 
 
 def _freeze_week(season: int, week: int) -> int:
@@ -107,7 +156,7 @@ def _freeze_week(season: int, week: int) -> int:
 
 
 def saved_count(season: int, week: int) -> int:
-    saved = props.load_lines(season, week)
+    saved = _lines(season, week)
     return 0 if saved is None or saved.empty else len(saved)
 
 
@@ -118,7 +167,7 @@ def line_counts_by_game(scope_proj: pd.DataFrame, season: int, week: int) -> dic
     (player, stat) prop that resolves to something we actually project, so the
     count matches exactly what the game page can show.
     """
-    lines = props.load_lines(season, week)
+    lines = _lines(season, week)
     if (lines is None or lines.empty or scope_proj is None or scope_proj.empty
             or "game_id" not in scope_proj.columns):
         return {}
@@ -141,7 +190,7 @@ def props_by_name(scope_proj: pd.DataFrame, season: int, week: int) -> dict:
     Feeds the expandable roster rows on the game page, so a player's lines open
     underneath his own row instead of living in a separate table.
     """
-    lines = props.load_lines(season, week)
+    lines = _lines(season, week)
     if lines is None or lines.empty or scope_proj is None or scope_proj.empty:
         return {}
     table, _ = props.compare(lines, scope_proj, predict.load_registry())
@@ -246,7 +295,7 @@ def render_board(scope_proj: pd.DataFrame, season: int, week: int,
     EXPLANATION rather than silence: a board that says nothing after "600 lines
     saved" reads as broken.
     """
-    lines = props.load_lines(season, week)
+    lines = _lines(season, week)
     if lines is None or lines.empty:
         return 0
     reg = predict.load_registry()
