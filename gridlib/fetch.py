@@ -335,24 +335,59 @@ def load_players(ttl: int = 24 * 3600):
 
 
 # ── Depth charts: the schema trap ────────────────────────────────────────────
+# The derived depth chart, memoized per season. This file is the largest thing
+# the app touches (554,215 rows for 2025, ~300 MB read and ~440 MB once the week
+# column is derived), and `build_inference_rows` asks for it 32 times a week:
+# once per team per game, each time to keep about 21 rows. Measured before this
+# memo, each call cost 0.45 s and ~100 MB of RSS that never came back, so a
+# single week's board spent roughly 14 s and several hundred MB re-deriving the
+# same frame. On a container with about 1 GB that was most of an OOM.
+#
+# Kept small deliberately. Two seasons is what any page needs (the current one,
+# and the prior one for features), and an unbounded dict here would be a slower
+# version of the leak it replaces.
+_DEPTH_MEMO: dict[int, tuple[float, object]] = {}
+_DEPTH_MEMO_MAX = 2
+
+
+def clear_depth_chart_memo() -> None:
+    """Drop the memo. For tests, and for anything that rewrites the file."""
+    _DEPTH_MEMO.clear()
+
+
 def load_depth_charts(season: int, ttl: int = 1800):
-    """Depth charts, with the 2025+ schema handled.
+    """Depth charts, with the 2025+ schema handled. Memoized for `ttl` seconds.
 
     From 2025 onward these files have **no `week` column at all**. They carry a
     `dt` ISO8601 timestamp instead (verified: 2025 and 2026 both ship
     `dt`/`team`/`player_name`/`espn_id`/`gsis_id`/`pos_*`, no `week`). Code that
     assumes `week` breaks silently, so this loader always ADDS a `week` column,
     derived from the timestamp against the schedule when it is missing.
+
+    The returned frame is SHARED between callers, so treat it as read-only.
+    Every consumer today either slices it (boolean indexing always copies) or
+    renames first, which copies as well; a caller that assigns into it in place
+    would corrupt the chart for the rest of the process.
     """
+    hit = _DEPTH_MEMO.get(season)
+    if hit is not None and (time.time() - hit[0]) < ttl:
+        return hit[1]
+
     df = _seasonal("depth_charts", "depth_charts", season, ttl, "depth_charts")
     if df is None:
         return None
     if "week" in df.columns:
-        return df
-    if "dt" not in df.columns:
+        out = df
+    elif "dt" not in df.columns:
         logger.warning("depth_charts %d has neither `week` nor `dt`; leaving as is", season)
-        return df
-    return _attach_week_from_timestamp(df, season)
+        out = df
+    else:
+        out = _attach_week_from_timestamp(df, season)
+
+    if len(_DEPTH_MEMO) >= _DEPTH_MEMO_MAX:
+        _DEPTH_MEMO.pop(min(_DEPTH_MEMO, key=lambda k: _DEPTH_MEMO[k][0]), None)
+    _DEPTH_MEMO[season] = (time.time(), out)
+    return out
 
 
 def _attach_week_from_timestamp(df: pd.DataFrame, season: int) -> pd.DataFrame:
@@ -720,7 +755,12 @@ def depth_chart_normalized(season: int) -> pd.DataFrame:
     cols = set(dc.columns)
     if {"club_code", "depth_team", "position"} <= cols:
         # The 2001-2024 shape.
-        out = dc.rename(columns={"club_code": "team", "depth_team": "depth_rank"})
+        # .copy() because the next line OVERWRITES `position` in place, and
+        # `dc` is now the shared memoized frame. rename() happens to copy in
+        # pandas 2.3.3, which makes this redundant today and is not a promise
+        # worth resting the whole chart on.
+        out = dc.rename(columns={"club_code": "team",
+                                 "depth_team": "depth_rank"}).copy()
         if "game_type" in out.columns:
             out = out[out["game_type"] == "REG"]
         out["position"] = out["position"].map(_DEPTH_POS_MAP)

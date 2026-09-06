@@ -254,3 +254,62 @@ def test_missing_team_param_returns_none():
 def test_week_with_no_games_returns_none():
     g = _week1_frame()
     assert fetch.find_game(2026, 14, "NE", "SEA", g) is None
+
+
+def test_depth_chart_memo_returns_the_same_data_and_stays_bounded():
+    """The memo exists for memory, so it must not become a memory leak, and it
+    must not hand back a frame someone else mutated.
+
+    `build_inference_rows` asks for the depth chart 32 times a week, once per
+    team per game, each time to keep about 21 rows out of 554,215. Measured
+    before the memo: 0.45 s and ~100 MB of RSS per call that never came back,
+    17.3 s and a 476 MB peak for one week's board, on a container with about
+    1 GB. The risk a memo introduces is a stale or shared-and-mutated frame, so
+    that is what this pins.
+    """
+    from gridlib import fetch
+
+    fetch.clear_depth_chart_memo()
+    first = fetch.load_depth_charts(2025)
+    if first is None or first.empty:
+        pytest.skip("2025 depth chart not cached")
+    baseline = first.copy()
+
+    assert fetch.load_depth_charts(2025).equals(baseline), "memo hit differs"
+    fetch.clear_depth_chart_memo()
+    assert fetch.load_depth_charts(2025).equals(baseline), "re-derived differs"
+
+    # The one consumer that overwrites a column must not reach the shared frame.
+    fetch.depth_chart_normalized(2025)
+    assert fetch.load_depth_charts(2025).equals(baseline), (
+        "depth_chart_normalized mutated the shared memoized chart"
+    )
+
+    fetch.clear_depth_chart_memo()
+    for season in (2023, 2024, 2025):
+        fetch.load_depth_charts(season)
+    assert len(fetch._DEPTH_MEMO) <= fetch._DEPTH_MEMO_MAX, (
+        "the memo is unbounded, which is a slower version of the leak it "
+        "replaces"
+    )
+
+
+def test_latest_depth_chart_is_unchanged_by_the_memo():
+    """Slices must be identical whether or not a previous call warmed the memo."""
+    from gridlib import fetch
+
+    fresh, memoed = {}, {}
+    for week in (1, 6, 12):
+        for team in ("KC", "SF", "PHI", "LV", "LAC"):
+            fetch.clear_depth_chart_memo()
+            fresh[(week, team)] = fetch.latest_depth_chart(2025, week, team)
+    if all(v.empty for v in fresh.values()):
+        pytest.skip("2025 depth chart not cached")
+
+    fetch.clear_depth_chart_memo()
+    for week in (1, 6, 12):
+        for team in ("KC", "SF", "PHI", "LV", "LAC"):
+            memoed[(week, team)] = fetch.latest_depth_chart(2025, week, team)
+
+    bad = [k for k in fresh if not fresh[k].equals(memoed[k])]
+    assert not bad, f"memoized slices differ for {bad}"
