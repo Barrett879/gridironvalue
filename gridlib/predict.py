@@ -480,12 +480,41 @@ def project_week(season: int, week: int,
         if meta["present_as"] == "baseline":
             # The model is measurably worse than a season-to-date average for
             # this target, so serve the average and say so.
+            # PER ROW, not all-or-nothing. This was
+            # `if base is None or base.isna().all()`, so the declared fallback
+            # to the career rate fired only in week 1, when every f_std_* is
+            # NaN. From week 2 the column is populated for most of the league,
+            # `isna().all()` is False, and every player who has not yet
+            # recorded a stat line this season fell through to `.fillna(0.0)`
+            # and was served exactly 0.00. On 2025 week 6 that was 109 of 570
+            # rows, 71 of them with a career rate sitting right there unused.
+            #
+            # A zero is not a small number here, it is a claim. `props.compare`
+            # builds the anytime-TD lambda as rushing_tds + receiving_tds and
+            # skips the row when it is not positive, so those players lost the
+            # prop entirely.
+            #
+            # Last resort is the TRAINING MEAN for this target's positions,
+            # which is what the ship gate itself used
+            # (scripts/validate_models.py fills a missing baseline-2 with
+            # `y_tr.mean()`, never with zero). Serving 0.0 was not the baseline
+            # that was measured.
             col = f"f_std_{target}"
             fallback = f"f_career_{target}"
-            base = live[col] if col in live.columns else None
-            if base is None or base.isna().all():
-                base = live[fallback] if fallback in live.columns else np.nan
-            live[target] = pd.to_numeric(base, errors="coerce").fillna(0.0)
+            base = (pd.to_numeric(live[col], errors="coerce")
+                    if col in live.columns
+                    else pd.Series(np.nan, index=live.index))
+            if fallback in live.columns:
+                base = base.fillna(pd.to_numeric(live[fallback],
+                                                 errors="coerce"))
+            fill = 0.0
+            if target in hist.columns:
+                _pos = meta.get("positions") or []
+                _tr = hist.loc[hist["position"].isin(_pos), target]
+                _m = pd.to_numeric(_tr, errors="coerce").mean()
+                if pd.notna(_m):
+                    fill = float(_m)
+            live[target] = base.fillna(fill)
             continue
         path = MODELS_DIR / meta["file"]
         if not path.exists():

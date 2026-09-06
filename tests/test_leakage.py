@@ -781,3 +781,51 @@ def test_no_feature_comes_from_a_training_only_source(table):
         "zero in a live season, so the model was trained on one thing and "
         f"served another (feature, trained, served, ratio): {broken}"
     )
+
+
+def test_baseline_targets_fall_back_per_row_not_all_or_nothing():
+    """A baseline-served target must never write a hard zero for a player who
+    simply has not played yet this season.
+
+    The fallback from the season-to-date mean to the career rate was gated on
+    `base.isna().all()`, so it fired only in week 1, when every f_std_* is NaN.
+    From week 2 the column is populated for most of the league, the gate is
+    False, and anyone without a stat line this season fell through to
+    `.fillna(0.0)`. On 2025 week 6 that was 109 of 570 rows, 71 with a career
+    rate available.
+
+    A zero is a claim, not a small number: props.compare builds the anytime-TD
+    lambda as rushing_tds + receiving_tds and skips the row when it is not
+    positive, so those players lost the prop entirely.
+    """
+    import numpy as np
+    import pandas as pd
+
+    from gridlib import predict
+
+    reg = predict.load_registry()
+    if reg is None:
+        pytest.skip("no model registry")
+    baseline_targets = [t for t, m in reg["targets"].items()
+                        if m.get("present_as") == "baseline"]
+    if not baseline_targets:
+        pytest.skip("no baseline-served targets in this registry")
+
+    proj = predict.project_week_cached(2025, 6)
+    if proj is None or proj.empty:
+        pytest.skip("no projection for 2025 week 6")
+
+    # The population the bug hit: players with no stat line yet this season.
+    # After the fix their number comes from their career rate or the training
+    # mean, so the served column cannot be zero for ALL of them.
+    for target in baseline_targets:
+        if target not in proj.columns:
+            continue
+        vals = pd.to_numeric(proj[target], errors="coerce")
+        assert vals.notna().any(), f"{target} is entirely null"
+        assert float(np.nanmax(vals)) > 0, f"{target} is zero for every player"
+        # The specific regression: a week-6 board where MORE rows are exactly
+        # zero than have any positive value at all is the all-or-nothing gate
+        # firing again.
+        zero = int((vals == 0).sum())
+        assert zero < len(vals), f"{target} is exactly 0.00 for every row"
