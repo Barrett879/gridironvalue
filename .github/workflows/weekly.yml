@@ -98,7 +98,19 @@ jobs:
         run: |
           git config user.name  "gridironvalue-bot"
           git config user.email "gridironvalue-bot@users.noreply.github.com"
-          git add cache/player_week_*_v1.parquet cache/team_week_*_v1.parquet
+          # The DOUBLE-year form only. The builders write both
+          # cache/player_week_2026_v1.parquet (per-season) and
+          # cache/player_week_2026_2026_v1.parquet (combined), and .gitignore
+          # un-ignores only the second. A single-year glob expands to include
+          # the ignored file, and `git add` given an explicitly named ignored
+          # path exits 1; steps run under `bash -e`, so the job died before
+          # commit and push. It would have failed every week from week 1
+          # onward, silently leaving the deployed site projecting as if the
+          # season had not started, which is the exact degradation this
+          # workflow exists to prevent. It could not fail before week 1,
+          # because then the glob matches nothing new and there is nothing to
+          # commit. `-f` would be wrong: it would commit the per-season files.
+          git add cache/player_week_*_*_v1.parquet cache/team_week_*_*_v1.parquet
           if git diff --cached --quiet; then
             echo "no change this week"
           else

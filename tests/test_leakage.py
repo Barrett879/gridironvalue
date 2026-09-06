@@ -695,3 +695,70 @@ def test_unfiled_team_is_not_served_the_healthy_baseline():
         "the team that filed should get the healthy rate for an undesignated "
         "player; the team that has not filed should get the lower marginal one"
     )
+
+
+def test_no_feature_comes_from_a_training_only_source(table):
+    """A feature the live season cannot populate is worse than no feature.
+
+    `routes_run_proxy` comes from participation data, which nflverse publishes
+    only AFTER the postseason and never updates in season. The backfill has real
+    values for every completed season and the season the site actually serves
+    has none, so `_prior_mean`'s zero-fill made every live game contribute
+    routes = 0. Measured by nulling 2025's routes and rebuilding, which is what
+    a live season looks like: `f_r3_routes_run_proxy` trained on 20.13 and
+    served 0.51, exactly zero on 93.1% of rows; `f_std_` trained on 20.20 and
+    served 0.00 on 97.1%. Four such features were in the shipped model.
+
+    This simulates the live season rather than naming the column, so a new
+    feature built from any training-only source is caught the same way.
+    """
+    import numpy as np
+
+    from gridlib import features as F
+    from gridlib.cache import dc_path, read_parquet_or_none
+
+    lg = read_parquet_or_none(dc_path("league_season_2016_2025_v1.parquet"))
+    sub = table[table["season"].isin([2024, 2025])]
+    if len(sub) < 2000 or lg is None:
+        pytest.skip("backfill too small, or league table missing")
+    priors = F.league_priors(sub, 2025)
+
+    # Every source column that participation supplies is absent in a live
+    # season. Null the served season's copies and rebuild.
+    live = sub.copy()
+    for col in ("routes_run_proxy", "pass_snaps"):
+        if col in live.columns:
+            live.loc[live["season"] == 2025, col] = np.nan
+
+    real = F.build(sub, lg, priors)
+    served = F.build(live, lg, priors)
+    cols = F.feature_columns(real)
+
+    mask = (real["season"] == 2025) & (real["week"] >= 6)
+    if mask.sum() < 200:
+        pytest.skip("not enough live-season rows")
+
+    # Compare the SAME rows across the two builds. Comparing a feature against
+    # zero instead would flag ordinary sparsity: f_r3_attempts is 0 for 85% of
+    # rows because most players are not quarterbacks, which is correct and is
+    # identical in both builds. What matters is whether the served value
+    # DIVERGES from the trained one, and only an absent source does that.
+    broken = []
+    idx = real.index[mask]
+    for c in cols:
+        if c not in served.columns:
+            continue
+        a = pd.to_numeric(real.loc[idx, c], errors="coerce")
+        b = pd.to_numeric(served.loc[idx, c], errors="coerce")
+        if a.notna().mean() < 0.5 or abs(float(a.mean())) < 1.0:
+            continue
+        ratio = float(b.fillna(0).mean()) / float(a.fillna(0).mean())
+        if ratio < 0.5:
+            broken.append((c, round(float(a.mean()), 2),
+                           round(float(b.fillna(0).mean()), 2), round(ratio, 3)))
+
+    assert not broken, (
+        "these model features are populated in the backfill and collapse to "
+        "zero in a live season, so the model was trained on one thing and "
+        f"served another (feature, trained, served, ratio): {broken}"
+    )

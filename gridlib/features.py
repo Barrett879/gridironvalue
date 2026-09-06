@@ -64,8 +64,33 @@ VOLUME_STATS = [
     "attempts", "completions", "passing_yards", "passing_tds",
     "passing_interceptions", "sacks_suffered",
     "fg_att", "fg_made", "pat_att",
-    "off_snaps", "routes_run_proxy",
+    "off_snaps",
 ]
+
+# routes_run_proxy is NOT here, and that is the point. It comes from
+# participation data, which nflverse publishes only AFTER the postseason and
+# never updates in season, so it is TRAINING-ONLY: the backfill has real values
+# for 2016-2025 and the season the site is actually serving has none. The four
+# history features built from it (career, r3, r8, std) were in the shipped
+# model, and `_prior_mean` zero-fills a missing count, so every game of a live
+# season contributed routes = 0. Measured by nulling 2025's routes and
+# rebuilding, which is exactly what a live season looks like:
+#
+#     feature                     trained on    served    exactly 0
+#     f_r3_routes_run_proxy            20.13      0.51        93.1%
+#     f_r8_routes_run_proxy            20.41      2.99        61.9%
+#     f_std_routes_run_proxy           20.20      0.00        97.1%
+#     f_career_routes_run_proxy        20.51     11.07        21.2%
+#
+# Dropping them costs between 0.02% and 0.43% MAE across targets, receptions,
+# receiving yards, carries and rushing yards, measured train<=2023 scored on
+# 2024 where the data IS complete. That is inside the noise floor the ablation
+# gate already ignores, so the features were paying nothing even when they
+# worked. `off_snaps` is the live exposure proxy and is unaffected.
+#
+# The column itself stays in the backfill: it is the correct denominator for a
+# target-per-route-run rate and is worth having for analysis. It just may not
+# become a model feature.
 
 # Prior RED-ZONE opportunity, kept as a separately switchable block so its value
 # can be ablated rather than assumed. Touchdowns are the targets that failed the
