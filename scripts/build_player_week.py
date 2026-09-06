@@ -496,10 +496,32 @@ def build_season(season: int) -> pd.DataFrame | None:
     # season, so a season with no high-altitude rows means the join broke.
     _ALTITUDE_M = {"DEN00": 1610.0, "MEX00": 2240.0}
     df["altitude_m"] = df["stadium_id"].map(_ALTITUDE_M).fillna(0.0)
-    if not (df["altitude_m"] > 0).any():
+    # Check the MAP, not the calendar.
+    #
+    # This used to raise when a season had no high-altitude rows, on the
+    # reasoning that Denver hosts games every year. True for a full season and
+    # false for a PARTIAL one: Denver's first 2026 home game is week 2, so the
+    # weekly refresh job's very first run, a week-1-only rebuild, would have
+    # raised and killed the automation before it ever committed anything.
+    #
+    # Comparing rows that SHOULD have altitude against rows that DO catches a
+    # broken join on any slate, including one with no high-altitude game at all.
+    # Two checks, because the equality alone is not enough: if EVERY stadium_id
+    # were wrong, expected and got would both be zero and it would pass. The
+    # original failure was the merge not happening at all, which shows up as a
+    # column of nulls, so assert the column is populated first.
+    _null = float(df["stadium_id"].isna().mean())
+    if _null > 0.05:
         raise ValueError(
-            f"No high-altitude rows in season {season}. Denver hosts games "
-            "every season, so the stadium_id join is broken."
+            f"stadium_id is {_null:.0%} null in season {season}; the schedule "
+            "merge did not bring it through."
+        )
+    _expected = int(df["stadium_id"].isin(_ALTITUDE_M).sum())
+    _got = int((df["altitude_m"] > 0).sum())
+    if _expected != _got:
+        raise ValueError(
+            f"Altitude join broken in season {season}: {_expected} rows are at "
+            f"a high-altitude venue but {_got} carry an altitude."
         )
 
     # Rest DIFFERENTIAL, not just own rest. A team on six days against one on

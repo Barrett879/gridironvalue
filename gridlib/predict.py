@@ -399,7 +399,11 @@ def project_week(season: int, week: int,
         # who dressed and was never targeted from one who saw a little work.
         # Monotone, so it cannot reorder players. A no-op for every other target.
         from . import uncertainty as _u
+        raw_mean = pred.copy()
         pred = _u.apply_level(target, pred)
+        # Keep the UNCALIBRATED mean for the aggregate column. See below.
+        live[f"__raw_{target}"] = np.where(
+            live["position"].isin(meta["positions"]).to_numpy(), raw_mean, np.nan)
         # A model only applies to the positions it was trained on.
         applies = live["position"].isin(meta["positions"]).to_numpy()
         live[target] = np.where(applies, pred, np.nan)
@@ -412,14 +416,34 @@ def project_week(season: int, week: int,
     keep = [c for c in keep if c in live.columns]
     tcols = [c for c in reg["targets"] if c in live.columns]
     scols = [f"{t}_source" for t in tcols if f"{t}_source" in live.columns]
-    out = live[keep + tcols + scols].copy()
+    # Carry the uncalibrated means through; they feed the aggregate column below
+    # and are dropped again before returning.
+    rcols = [f"__raw_{t}" for t in tcols if f"__raw_{t}" in live.columns]
+    out = live[keep + tcols + scols + rcols].copy()
 
     # The unconditional twin of every projection. ONLY aggregates and the
     # coherence checks may use these; the board and the props comparison use
     # the conditional column above, because a prop voids on a DNP.
     for t in tcols:
-        out[f"{t}_expected"] = out[t] * out["p_play"]
+        # AGGREGATES USE THE UNCALIBRATED MEAN, not the level-corrected value.
+        #
+        # The level calibration is fitted and gated on per-player MAE, which is
+        # minimised by the median, so it deliberately pulls projections down
+        # toward it. That is right for a number shown next to a line and wrong
+        # for a number summed across a roster: on 2025 week 6, restricted to
+        # players who actually appeared, the calibrated receiving projections
+        # summed to 85% of actual while rushing yards summed to 1.00. Two
+        # coherence gates failed as a result, and the MAE gate could not see it
+        # because MAE is per-player and insensitive to a systematic shift that
+        # reduces absolute error on the many near-zero rows.
+        #
+        # This is the same two-estimand split the module already enforces
+        # between {target} and {target}_expected, applied one level deeper.
+        _raw = out.get(f"__raw_{t}")
+        _base = _raw if _raw is not None and _raw.notna().any() else out[t]
+        out[f"{t}_expected"] = _base * out["p_play"]
 
+    out = out.drop(columns=[c for c in out.columns if c.startswith("__raw_")])
     out["f_games_prior"] = live.get("f_games_prior", np.nan)
     return out.sort_values(["team", "position", "depth_rank"]).reset_index(drop=True)
 

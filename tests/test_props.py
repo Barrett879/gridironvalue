@@ -1171,3 +1171,38 @@ def test_readonly_blocks_the_destructive_clear(tmp_path, monkeypatch):
     monkeypatch.setattr(C, "READ_ONLY", False)
     props_ui._clear_lines(2026, 7)
     assert props.load_lines(2026, 7) is None, "local clear should still work"
+
+
+def test_grade_covers_probability_props():
+    """Touchdown props were dropped from grading entirely because ACTUAL_MAP has
+    no "__prob__" key, so 321 of 1022 frozen rows, every touchdown prop and 31%
+    of the board, could never enter the accuracy record."""
+    table, _ = props.compare(_td_lines(), _td_proj())
+    assert table.iloc[0]["kind"] == "probability"
+    actuals = pd.DataFrame([{"player_display_name": "Ja'Marr Chase",
+                             "rushing_tds": 1.0, "receiving_tds": 0.0}])
+    g = props.grade(table, actuals)
+    assert len(g) == 1, "probability prop was dropped from grading"
+    assert g.iloc[0]["actual"] == 1.0
+    assert g.iloc[0]["result"] == "More"
+
+
+def test_grade_joins_on_gsis_id_not_a_name():
+    """Joining picks to outcomes on a normalised NAME is what the rest of this
+    project refuses to do: a suffix or a diacritic drops the row silently."""
+    table, _ = props.compare(_td_lines(), _td_proj())
+    # Same player, DIFFERENT spelling, same id. A name join would miss this.
+    actuals = pd.DataFrame([{"player_display_name": "Jamarr Chase Jr.",
+                             "gsis_id": "00-0036900",
+                             "rushing_tds": 1.0, "receiving_tds": 0.0}])
+    g = props.grade(table, actuals)
+    assert len(g) == 1, "id join failed; the row was dropped on a name mismatch"
+
+
+def test_count_props_are_priced_as_probabilities():
+    """Pass TDs, INT and FG Made are counts against half-point lines, so a mean
+    can sit on the opposite side of the line from the median. They were the last
+    stats still leaning off the raw gap."""
+    for stat in ("Pass TDs", "INT", "FG Made"):
+        cols, _s, _r = props._resolve_stat(stat)
+        assert cols and cols[0] == "__prob__", f"{stat} is still priced as a mean"

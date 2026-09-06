@@ -815,11 +815,28 @@ def add_team_history(df: pd.DataFrame, league_by_season: pd.DataFrame) -> pd.Dat
         tg[f"f_team_prior_{col}"] = _prior_mean(tg, "team", col)
         tg[f"f_team_r4_{col}"] = _prior_roll_mean(tg, "team", col, 4)
 
-    # Centre PROE on the prior season's league mean.
-    lg = league_by_season.set_index("season")["league_off_proe"]
-    prior_lg = lg.shift(1)
+    # Centre PROE on the MOST RECENT PRIOR season's league mean.
+    #
+    # This was `lg.shift(1)` indexed by season, which only produces a value for
+    # seasons that appear in the league table. The table ends at 2025, so for
+    # every 2026 row the lookup returned NaN and `f_team_proe_centered` was
+    # null for 100% of live projections while its two siblings were at 100%.
+    # The models trained on it. Fourth instance of this project's signature bug:
+    # a column that exists in training, is absent at serve time, and degrades
+    # without erroring.
+    #
+    # Taking the latest season strictly before this row's works whether or not
+    # the current season is in the table, which is the case that matters, since
+    # the league table by construction only holds COMPLETED seasons.
+    _lg = (league_by_season.dropna(subset=["league_off_proe"])
+                           .sort_values("season")
+                           .set_index("season")["league_off_proe"])
+    _prior = {}
+    for _s in sorted(tg["season"].dropna().unique()):
+        _before = _lg[_lg.index < _s]
+        _prior[_s] = float(_before.iloc[-1]) if len(_before) else np.nan
     tg["f_team_proe_centered"] = (
-        tg["f_team_prior_off_proe"] - tg["season"].map(prior_lg)
+        tg["f_team_prior_off_proe"] - tg["season"].map(_prior)
     )
 
     keep = ["game_id", "team"] + [c for c in tg.columns if c.startswith("f_team_")]

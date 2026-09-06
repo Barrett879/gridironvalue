@@ -352,7 +352,16 @@ def test_missing_depth_rank_does_not_crash_or_assume_starter():
 
     out = predict.attach_p_play(pd.DataFrame({"position": ["WR"],
                                               "depth_rank": [np.nan]}))
-    assert 0.0 <= out["p_play"].iloc[0] <= 1.0
+    p = float(out["p_play"].iloc[0])
+    # This asserted only 0 <= p <= 1, which ADMITS p = 1.0, the exact
+    # "assume starter" case the name says it prevents. Any number between zero
+    # and one passed, so the test could not fail.
+    assert 0.0 <= p <= 1.0
+    starter = predict.attach_p_play(pd.DataFrame({"position": ["WR"],
+                                                  "depth_rank": [1]}))
+    assert p < float(starter["p_play"].iloc[0]), (
+        f"a player with no depth rank was given {p:.3f}, at or above the "
+        "rank-1 probability; an unknown rank must not be read as a starter")
 
 
 # ── Train/serve parity: the skew that silently drops a feature ───────────────
@@ -371,6 +380,23 @@ def test_inference_rows_derive_every_feature_the_backfill_does(table):
         f"backfill is missing {derived - present}; if the backfill stops "
         f"deriving these, the ablation and the registry are out of sync"
     )
+
+    # The body above only checked the BACKFILL, while the name promises the
+    # INFERENCE path. It never called build_inference_rows, so the very skew it
+    # is named for could ship underneath it. Call it.
+    from gridlib import fetch, predict
+    season = fetch.current_season()
+    week = fetch.current_week(season) or 1
+    inf = predict.build_inference_rows(season, week)
+    if inf is None or inf.empty:
+        pytest.skip(f"no depth chart for {season} week {week}")
+    missing = derived - set(inf.columns)
+    assert not missing, (
+        f"build_inference_rows does not derive {missing}; the models train on "
+        "them, so every live row would carry NaN and the feature would stop "
+        "working without erroring")
+    for c in derived:
+        assert inf[c].notna().all(), f"{c} is null for some inference rows"
 
 
 def test_predict_refuses_to_serve_with_missing_features(monkeypatch):

@@ -95,14 +95,19 @@ VERSION = "v1"
 STAT_MAP: dict[str, tuple[tuple[str, ...], float]] = {
     "pass yards": (("passing_yards",), 1.0),
     "passing yards": (("passing_yards",), 1.0),
-    "pass tds": (("passing_tds",), 1.0),
-    "pass touchdowns": (("passing_tds",), 1.0),
+    # COUNTS against half-point lines, so they are probability props for the
+    # same reason anytime-touchdown is. A quarterback projected 1.44 passing
+    # touchdowns against a 1.0 line needs TWO, and P(>=2) at lambda 1.44 is
+    # 0.42, so the mean said More where the distribution says Less. These were
+    # the last stats still leaning off the mean gap after the median change.
+    "pass tds": (("__prob__", "passing_tds"), 1.0),
+    "pass touchdowns": (("__prob__", "passing_tds"), 1.0),
     "pass attempts": (("attempts",), 1.0),
     "pass completions": (("completions",), 1.0),
     "completions": (("completions",), 1.0),
-    "interceptions thrown": (("passing_interceptions",), 1.0),
-    "int": (("passing_interceptions",), 1.0),
-    "sacks taken": (("sacks_suffered",), 1.0),
+    "interceptions thrown": (("__prob__", "passing_interceptions"), 1.0),
+    "int": (("__prob__", "passing_interceptions"), 1.0),
+    "sacks taken": (("__prob__", "sacks_suffered"), 1.0),
     "rush yards": (("rushing_yards",), 1.0),
     "rushing yards": (("rushing_yards",), 1.0),
     "rush attempts": (("carries",), 1.0),
@@ -149,8 +154,8 @@ STAT_MAP: dict[str, tuple[tuple[str, ...], float]] = {
     "pass+rush yards": (("passing_yards", "rushing_yards"), 1.0),
     "pass + rush yards": (("passing_yards", "rushing_yards"), 1.0),
     "rec+rush yards": (("receiving_yards", "rushing_yards"), 1.0),
-    "fg made": (("fg_made",), 1.0),
-    "field goals made": (("fg_made",), 1.0),
+    "fg made": (("__prob__", "fg_made"), 1.0),
+    "field goals made": (("__prob__", "fg_made"), 1.0),
     # 3 points a field goal, 1 an extra point. This was ("fg_made", "pat_att")
     # with scale 1.0 and a comment saying "approximated below", but nothing
     # below approximated anything: compare() sums the columns, so the model
@@ -1056,18 +1061,55 @@ def grade(table: pd.DataFrame, actuals: pd.DataFrame) -> pd.DataFrame:
     act = actuals.copy()
     act["_key"] = act["player_display_name"].map(normalize_name)
     by_key = act.drop_duplicates("_key").set_index("_key")
+    # PREFER gsis_id. Joining picks to outcomes on a normalised NAME is exactly
+    # what the rest of this project refuses to do, and it fails silently: a
+    # suffix, a diacritic or a mid-season legal-name change drops the row from
+    # the record with no counter. The frozen snapshot carries gsis_id, so use it
+    # and keep the name only as the fallback for rows frozen before it existed.
+    by_id = None
+    if "gsis_id" in act.columns:
+        _a = act[act["gsis_id"].notna()]
+        if not _a.empty:
+            by_id = _a.drop_duplicates("gsis_id").set_index("gsis_id")
+
+    def _actual_row(r):
+        if by_id is not None:
+            gid = r.get("gsis_id")
+            if gid is not None and pd.notna(gid) and gid in by_id.index:
+                return by_id.loc[gid]
+        k = normalize_name(r["player"])
+        return by_key.loc[k] if k in by_key.index else None
 
     rows = []
     for _, r in table.iterrows():
         cols, scale, refusal = _resolve_stat(r["stat"])
         if cols is None or cols == ("__fantasy__",):
             continue
+        if cols and cols[0] == "__prob__":
+            # The MODEL value is a probability; the OUTCOME is a count. Grade the
+            # count against the posted line, exactly like any other prop. These
+            # were being dropped silently because ACTUAL_MAP has no "__prob__"
+            # entry, so 321 of the 1022 rows on the real week 1 board, 31% of
+            # the board and every touchdown prop, could never enter the record.
+            a_ = _actual_row(r)
+            if a_ is None:
+                continue
+            vals = [a_.get(ACTUAL_MAP.get(c_, c_)) for c_ in cols[1:]]
+            if any(v is None or pd.isna(v) for v in vals):
+                continue
+            actual = float(sum(float(v) for v in vals))
+            result = ("More" if actual > r["line"]
+                      else "Less" if actual < r["line"] else "Exact")
+            rows.append({**r.to_dict(), "actual": round(actual, 2),
+                         "result": result,
+                         "model_correct": (None if result == "Exact"
+                                           else result == r["lean"])})
+            continue
         if cols and cols[0] == "__wsum__":
             pairs = list(zip(cols[1::2], cols[2::2]))
-            key = normalize_name(r["player"])
-            if key not in by_key.index:
+            a_ = _actual_row(r)
+            if a_ is None:
                 continue
-            a_ = by_key.loc[key]
             vals = [a_.get(ACTUAL_MAP.get(c_, c_)) for c_, _ in pairs]
             if any(v is None or pd.isna(v) for v in vals):
                 continue
@@ -1079,10 +1121,9 @@ def grade(table: pd.DataFrame, actuals: pd.DataFrame) -> pd.DataFrame:
                          "model_correct": (None if result == "Exact"
                                            else result == r["lean"])})
             continue
-        key = normalize_name(r["player"])
-        if key not in by_key.index:
+        a = _actual_row(r)
+        if a is None:
             continue
-        a = by_key.loc[key]
         vals = [a.get(ACTUAL_MAP.get(c, c)) for c in cols]
         if any(v is None or pd.isna(v) for v in vals):
             continue  # did not play, or not scored
