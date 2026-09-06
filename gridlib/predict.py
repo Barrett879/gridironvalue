@@ -78,11 +78,21 @@ LEAGUE = "league_season_2016_2025_v1.parquet"
 # the last man rather than a rotation player) that pooling the eras biased the
 # grid low: 9.8 expected appearances per team against 11.9 observed, which
 # passed straight through into 0.84x team totals.
-AVAILABILITY = "availability_2025_2025_v1.parquet"
+# v2, and the bump is load-bearing. v1 was fit over a population inference
+# never sees: it included bye weeks (5.3% of rows, where appearing is
+# impossible) and injured players, so the cell rate was already unconditional
+# and the injury multiplier below counted injury a second time. Compounded,
+# the served board summed to 0.904 of actual appearances. Reading a v1 file
+# with this code would restore that bias silently, so the name has to change.
+AVAILABILITY = "availability_2025_2025_v2.parquet"
+ADJUSTMENTS = "availability_adj_2025_2025_v2.parquet"
 MAX_RANK = 6
-# Injury status -> multiplicative adjustment on the grid. The report is pregame
-# (Wed-Fri for a Sunday game), so this is legitimately knowable.
-INJURY_ADJ = {"Out": 0.02, "Doubtful": 0.25, "Questionable": 0.92}
+# Injury status -> multiplicative adjustment. Now MEASURED by
+# scripts/build_availability.py against players of the same position and rank,
+# and shipped beside the grid; this dict is only the fallback for a build that
+# predates the companion file. The old hardcoded Questionable of 0.92 was
+# outside the measured 95% interval of 0.71 to 0.85.
+INJURY_ADJ = {"Out": 0.02, "Doubtful": 0.10, "Questionable": 0.78}
 
 
 def availability_grid():
@@ -90,8 +100,33 @@ def availability_grid():
     return read_parquet_or_none(dc_path(AVAILABILITY))
 
 
-def attach_p_play(df: pd.DataFrame) -> pd.DataFrame:
+def injury_adjustments() -> dict[str, float]:
+    """Measured injury multipliers, falling back to the constants above."""
+    adj = read_parquet_or_none(dc_path(ADJUSTMENTS))
+    if adj is None or adj.empty:
+        return dict(INJURY_ADJ)
+    return {str(k): float(v)
+            for k, v in zip(adj["report_status"], adj["multiplier"])}
+
+
+def attach_p_play(df: pd.DataFrame,
+                  filed_teams: set[str] | None = None) -> pd.DataFrame:
     """Add `p_play`, the probability the player appears in the box score.
+
+    Two grids, because there are two situations and one rate cannot serve both:
+
+      A team that has FILED its injury report gets `p_play`, the rate for a
+      player carrying no designation, multiplied by the measured factor for
+      whatever designation this player has. Conditioning is legitimate here
+      because the thing being conditioned on is known.
+
+      A team that has NOT filed yet gets `p_play_any`, the marginal rate over
+      every playing row. Serving the healthy baseline to a team with no report
+      would over-count, because some of those players will be ruled out on
+      Friday and nothing in the frame says which.
+
+    `filed_teams` names the teams whose report is in hand. When it is None the
+    frame is asked instead: a team with any designated player has plainly filed.
 
     Falls back to 1.0 when the grid is missing, which keeps the site running
     and is loudly wrong rather than quietly wrong: the coherence checks will
@@ -108,15 +143,35 @@ def attach_p_play(df: pd.DataFrame) -> pd.DataFrame:
         return out
     rank = pd.to_numeric(out.get("depth_rank"), errors="coerce")
     out["_rank_capped"] = rank.clip(upper=MAX_RANK).fillna(MAX_RANK).astype(int)
-    key = grid.set_index(["position", "rank_capped"])["p_play"]
-    out["p_play"] = [
-        float(key.get((pos, rk), 0.5))
-        for pos, rk in zip(out["position"], out["_rank_capped"])
-    ]
-    # The injury report is the one case position and rank get badly wrong.
-    if "report_status" in out.columns:
-        adj = out["report_status"].map(INJURY_ADJ).fillna(1.0)
-        out["p_play"] = (out["p_play"] * adj).clip(0.0, 1.0)
+
+    status = (out["report_status"] if "report_status" in out.columns
+              else pd.Series(pd.NA, index=out.index))
+    if filed_teams is None:
+        filed_teams = set(out.loc[status.notna(), "team"].dropna().unique()) \
+            if "team" in out.columns else set()
+    filed = (out["team"].isin(filed_teams).to_numpy() if "team" in out.columns
+             else np.zeros(len(out), dtype=bool))
+    # A row that already carries a designation is itself proof the report
+    # covers this player, whatever the team-level signal says. Conditioning is
+    # always right when the thing to condition on is in hand.
+    filed = filed | status.notna().to_numpy()
+
+    # `p_play_any` is absent from a v1 grid. Falling back to the healthy column
+    # keeps an old artifact working rather than raising a KeyError on a board
+    # someone is looking at.
+    any_col = "p_play_any" if "p_play_any" in grid.columns else "p_play"
+    idx = grid.set_index(["position", "rank_capped"])
+    key_h, key_a = idx["p_play"], idx[any_col]
+    keys = list(zip(out["position"], out["_rank_capped"]))
+    p = np.array([float((key_h if f else key_a).get(k, 0.5))
+                  for k, f in zip(keys, filed)])
+
+    # Applied only where the report exists. A team that has not filed already
+    # carries the marginal rate, which has the injury effect inside it; the
+    # multiplier there would be the same double-count v1 shipped.
+    adj = status.map(injury_adjustments()).fillna(1.0).to_numpy()
+    p = np.where(filed, p * adj, p)
+    out["p_play"] = np.clip(p, 0.0, 1.0)
     return out.drop(columns=["_rank_capped"])
 
 
@@ -408,7 +463,15 @@ def project_week(season: int, week: int,
         applies = live["position"].isin(meta["positions"]).to_numpy()
         live[target] = np.where(applies, pred, np.nan)
 
-    live = attach_p_play(live)
+    # Ask the feed which teams have filed rather than inferring it from the
+    # frame. A team can file a report with no skill-position designations on
+    # it, and inferring would then read that team as not having filed and serve
+    # it the marginal rate, quietly shaving its whole slate.
+    _inj = fetch.injury_report(season, week)
+    _filed = (set(_inj["team"].dropna().unique())
+              if _inj is not None and not _inj.empty and "team" in _inj.columns
+              else None)
+    live = attach_p_play(live, filed_teams=_filed)
 
     keep = ["gsis_id", "player_display_name", "position", "team",
             "opponent_team", "game_id", "season", "week", "depth_rank",

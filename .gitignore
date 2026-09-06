@@ -18,7 +18,8 @@ cache/*
 !cache/player_week_2016_2025_v1.parquet
 !cache/team_week_2016_2025_v1.parquet
 !cache/league_season_2016_2025_v1.parquet
-!cache/availability_2025_2025_v1.parquet
+!cache/availability_2025_2025_v2.parquet
+!cache/availability_adj_2025_2025_v2.parquet
 
 # The two calibration layers. WITHOUT THESE THE DEPLOYED BOARD SILENTLY REVERTS
 # to gap-based leans, which is the bug the probability layer exists to fix:

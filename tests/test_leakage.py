@@ -527,3 +527,90 @@ def test_every_trained_column_is_a_subset_of_the_union():
             f"{target} was fitted on {sorted(extra)[:4]}, absent from the union, "
             "so the inference check would not verify they exist"
         )
+
+
+def test_availability_grid_is_fit_on_playing_teams_only():
+    """A bye-week row can never produce an appearance, so fitting over it is
+    pure downward bias on a population inference never scores.
+
+    645 of 12099 fitted rows were bye rows with an appearance rate of 0.0016,
+    which pulled every cell down by a factor of 0.947. The guard is the rate
+    itself: a grid fit with byes in it puts QB1 near 0.88, and a healthy
+    starting quarterback plays essentially every week his team does.
+    """
+    from gridlib import predict
+
+    grid = predict.availability_grid()
+    if grid is None or grid.empty:
+        import pytest
+        pytest.skip("availability grid not built")
+    key = grid.set_index(["position", "rank_capped"])["p_play"]
+    for pos in ("QB", "RB", "WR", "TE"):
+        assert key.get((pos, 1), 0.0) > 0.92, (
+            f"{pos}1 appears {key.get((pos, 1)):.3f} of the time. A healthy "
+            "starter plays; a rate this low means the fit population contains "
+            "weeks the player could not possibly have appeared."
+        )
+
+
+def test_injury_is_not_counted_twice():
+    """The multiplier may only be applied to a rate that excludes injury.
+
+    v1 fit the cell rate over every row, injured ones included, and then
+    multiplied by INJURY_ADJ at serve time. The healthy baseline must therefore
+    sit ABOVE the marginal rate, and a player with no designation must be
+    served the marginal rate rather than the healthy one when his team has not
+    filed. If the two columns ever collapse into each other, the distinction
+    that prevents the double-count has been lost.
+    """
+    from gridlib import predict
+
+    grid = predict.availability_grid()
+    if grid is None or grid.empty or "p_play_any" not in grid.columns:
+        import pytest
+        pytest.skip("availability grid not built, or predates the split")
+    thick = grid[grid["n"] >= 200]
+    assert len(thick) >= 10, "too few well-populated cells to judge"
+    # Judged where the gap is meaningful. In a cell that appears 20% of the
+    # time a designation barely moves anything, because the player mostly does
+    # not play regardless, and the two shrink priors can cross at the fourth
+    # decimal on noise. The rows that carry team totals are the ones that play.
+    real = thick[thick["p_play_any"] >= 0.4]
+    assert len(real) >= 8, "too few high-rate cells to judge"
+    assert (real["p_play"] >= real["p_play_any"]).all(), (
+        "a healthy player must appear at least as often as the average player "
+        "of the same position and rank, injured ones included"
+    )
+    assert (thick["p_play"] >= thick["p_play_any"] - 0.01).all(), (
+        "a cell where the healthy rate sits materially BELOW the marginal one "
+        "is not noise; the two populations have been swapped"
+    )
+    assert (thick["p_play"] > thick["p_play_any"] + 1e-6).any(), (
+        "the healthy and marginal rates are identical everywhere, so the "
+        "multiplier is being applied on top of a rate that already contains "
+        "injury. That is the v1 double-count."
+    )
+
+
+def test_unfiled_team_is_not_served_the_healthy_baseline():
+    """Before a team files, nothing is known, so the marginal rate is correct.
+
+    Serving the healthy baseline to a team with no report over-counts: some of
+    those players will be ruled out on Friday and nothing in the frame says
+    which.
+    """
+    import pandas as pd
+
+    from gridlib import predict
+
+    grid = predict.availability_grid()
+    if grid is None or grid.empty or "p_play_any" not in grid.columns:
+        import pytest
+        pytest.skip("availability grid not built, or predates the split")
+    df = pd.DataFrame({"position": ["WR", "WR"], "depth_rank": [1.0, 1.0],
+                       "team": ["AAA", "BBB"], "report_status": [None, None]})
+    out = predict.attach_p_play(df, filed_teams={"AAA"})
+    assert out["p_play"].iloc[0] > out["p_play"].iloc[1], (
+        "the team that filed should get the healthy rate for an undesignated "
+        "player; the team that has not filed should get the lower marginal one"
+    )
