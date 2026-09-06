@@ -412,11 +412,22 @@ def add_player_history(df: pd.DataFrame) -> pd.DataFrame:
     out = df.sort_values(["gsis_id", "season", "week"]).copy()
 
     grp = out.groupby("gsis_id", sort=False)
-    out["f_games_prior"] = grp.cumcount().astype(float)
-    # Games earlier in THIS season, which is what baseline 2 uses.
-    out["f_games_prior_season"] = (
-        out.groupby(["gsis_id", "season"], sort=False).cumcount().astype(float)
-    )
+    new: dict[str, pd.Series] = {
+        "f_games_prior": grp.cumcount().astype(float),
+        # Games earlier in THIS season, which is what baseline 2 uses.
+        "f_games_prior_season": (
+            out.groupby(["gsis_id", "season"], sort=False).cumcount().astype(float)),
+    }
+
+    # The player-season key, built ONCE. It was rebuilt inside the loop below
+    # via `out.assign(...)`, which deep-copies the whole frame: 63,650 rows by
+    # 280 columns, seventeen times, all to attach one string column that is
+    # identical on every pass. That was most of the 870 MB of transient
+    # allocation the build spent to produce a 191 MB frame, on a container with
+    # about 1 GB.
+    season_key = pd.DataFrame({
+        "_k": out["gsis_id"].astype(str) + "_" + out["season"].astype(str),
+    }, index=out.index)
 
     stats = (VOLUME_STATS
              + (REDZONE_STATS if USE_REDZONE_BLOCK else [])
@@ -433,20 +444,25 @@ def add_player_history(df: pd.DataFrame) -> pd.DataFrame:
         # the model that every uncovered week was a flawless one.
         is_rate = col.startswith("ngs_") or col.startswith("pfr_")
         if is_rate:
-            out[f"f_career_{col}"] = _prior_mean_skipna(out, "gsis_id", col)
+            new[f"f_career_{col}"] = _prior_mean_skipna(out, "gsis_id", col)
             # A rolling window over a sparse column is mostly empty, and the
             # career mean already carries the signal, so rates get one feature
             # each rather than four. Fewer, better-populated columns.
             continue
-        out[f"f_career_{col}"] = _prior_mean(out, "gsis_id", col)
+        new[f"f_career_{col}"] = _prior_mean(out, "gsis_id", col)
         for w in ROLL_WINDOWS:
-            out[f"f_r{w}_{col}"] = _prior_roll_mean(out, "gsis_id", col, w)
+            new[f"f_r{w}_{col}"] = _prior_roll_mean(out, "gsis_id", col, w)
         # Season-to-date, excluding the current game. This is mandatory
         # baseline 2 and also a feature in its own right.
         s_sum, s_n = _prior_sum_and_n(
-            out.assign(_k=out["gsis_id"].astype(str) + "_" + out["season"].astype(str)),
-            "_k", col)
-        out[f"f_std_{col}"] = s_sum / s_n.replace(0, np.nan)
+            season_key.assign(**{col: out[col]}), "_k", col)
+        new[f"f_std_{col}"] = s_sum / s_n.replace(0, np.nan)
+
+    # Attached in ONE concat rather than a hundred separate assignments. Adding
+    # columns one at a time to a frame this size makes pandas reconsolidate its
+    # blocks repeatedly; none of these builders read a previously added f_
+    # column, so there is no reason to attach them as we go.
+    return pd.concat([out, pd.DataFrame(new, index=out.index)], axis=1)
 
     return out
 

@@ -295,3 +295,55 @@ def test_context_panel_flags_a_retractable_roof_as_unknowable():
     row = _row(roof_type="retractable")
     html = store.render_context_panel(row)
     assert "decided on gameday" in html
+
+
+def test_project_week_cached_builds_once_under_concurrency(monkeypatch):
+    """A cold build peaks around 1.3 GB and the container has about 1 GB.
+
+    Streamlit gives every visitor their own script thread, so a cold cache plus
+    two arrivals in the same second meant two simultaneous builds, which is an
+    OOM that presents as a random restart. It also repeated 25 seconds of work
+    whose answer the first caller was about to write to disk.
+
+    The build itself is stubbed here: the property under test is how many times
+    it is entered, not what it returns.
+    """
+    import threading
+    import time
+
+    import pandas as pd
+
+    from gridlib import predict
+
+    calls = []
+
+    def slow_build(season, week, games=None):
+        calls.append((season, week))
+        time.sleep(0.4)          # long enough for the others to pile up
+        return pd.DataFrame({"gsis_id": ["x"], "season": [season],
+                             "week": [week]})
+
+    monkeypatch.setattr(predict, "project_week", slow_build)
+    monkeypatch.setattr(predict, "atomic_to_parquet",
+                        lambda df, path: None)          # no disk write
+    monkeypatch.setattr(predict, "read_parquet_or_none", lambda path: None)
+
+    results = {}
+
+    def call(i):
+        results[i] = predict.project_week_cached(2099, 1)
+
+    threads = [threading.Thread(target=call, args=(i,)) for i in range(5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(calls) == 1, (
+        f"{len(calls)} concurrent builds ran; each peaks around 1.3 GB on a "
+        "1 GB container"
+    )
+    assert len(results) == 5
+    assert all(len(r) == 1 for r in results.values()), (
+        "a caller that waited on the lock got nothing back"
+    )

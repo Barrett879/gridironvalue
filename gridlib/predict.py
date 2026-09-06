@@ -53,6 +53,8 @@ because it came out of a gradient booster.
 from __future__ import annotations
 
 import json
+import threading
+import time
 from pathlib import Path
 
 import joblib
@@ -324,26 +326,79 @@ def projections_path(season: int, week: int):
     return dc_path(f"predictions_{season}_w{week:02d}_{VERSION}.parquet")
 
 
+# One build at a time, per week. A cold `project_week` peaks around 1.3 GB
+# because the feature builder runs over ten seasons of history, and the
+# container has about 1 GB. A single build fits with room to spare; two
+# concurrent ones do not, and Streamlit gives every visitor their own script
+# thread, so a cold cache plus two arrivals in the same second was an OOM that
+# looked like a random restart. The lock also stops the second arrival
+# repeating 25 seconds of work whose answer the first is about to write.
+_BUILD_LOCKS: dict[tuple[int, int], threading.Lock] = {}
+_BUILD_LOCKS_GUARD = threading.Lock()
+# The result of the last build, in memory, so a waiter is served even when the
+# disk write did not happen. Relying on re-reading the file would mean that a
+# host where caching fails degrades to every waiter rebuilding in turn, which
+# is the slow version of the problem the lock exists to prevent. One entry:
+# the site renders one week at a time and an unbounded dict here would hold a
+# ~1 MB frame per week forever.
+_LAST_BUILD: dict[str, object] = {}
+
+
+def _build_lock(season: int, week: int) -> threading.Lock:
+    key = (int(season), int(week))
+    with _BUILD_LOCKS_GUARD:
+        lock = _BUILD_LOCKS.get(key)
+        if lock is None:
+            lock = _BUILD_LOCKS[key] = threading.Lock()
+        return lock
+
+
 def project_week_cached(season: int, week: int, ttl: int = 3600,
                         games: pd.DataFrame | None = None) -> pd.DataFrame:
-    """Disk-cached projections. Building from scratch takes ~25 seconds because
-    the feature builder runs over ten seasons of history, which is far too slow
-    to sit in a page render."""
+    """Disk-cached projections, with one build at a time per week.
+
+    Building from scratch takes ~25 seconds and peaks around 1.3 GB, because
+    the feature builder runs over ten seasons of history. That is far too slow
+    to sit in a page render and too large to run twice at once.
+    """
     from .cache import dc_fresh
     path = projections_path(season, week)
-    if dc_fresh(path, ttl=ttl):
-        cached = read_parquet_or_none(path)
+
+    key = (int(season), int(week))
+
+    def _read_fresh():
+        if dc_fresh(path, ttl=ttl):
+            got = read_parquet_or_none(path)
+            if got is not None:
+                return got
+        hit = _LAST_BUILD.get("value")
+        if hit is not None and _LAST_BUILD.get("key") == key \
+                and (time.time() - float(_LAST_BUILD.get("at", 0))) < ttl:
+            return hit
+        return None
+
+    cached = _read_fresh()
+    if cached is not None:
+        return cached
+
+    with _build_lock(season, week):
+        # Re-check inside the lock. Whoever held it was almost certainly
+        # building exactly this, so by now the answer is on disk and the wait
+        # was the whole point.
+        cached = _read_fresh()
         if cached is not None:
             return cached
-    fresh = project_week(season, week, games)
-    if not fresh.empty:
-        # kickoff is tz-aware; parquet round-trips it fine, but drop the column
-        # if it ever causes trouble rather than failing the whole write.
-        try:
-            atomic_to_parquet(fresh, path)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("could not cache projections: %s", e)
-    return fresh
+        fresh = project_week(season, week, games)
+        if not fresh.empty:
+            _LAST_BUILD.clear()
+            _LAST_BUILD.update(key=key, value=fresh, at=time.time())
+            # kickoff is tz-aware; parquet round-trips it fine, but drop the
+            # column if it ever causes trouble rather than failing the write.
+            try:
+                atomic_to_parquet(fresh, path)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("could not cache projections: %s", e)
+        return fresh
 
 
 def project_week(season: int, week: int,
