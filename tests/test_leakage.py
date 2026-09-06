@@ -119,40 +119,121 @@ def test_the_safe_set_is_actually_usable(table):
 
 
 # ── Point-in-time history ────────────────────────────────────────────────────
-def _prior_games(df: pd.DataFrame, gsis_id: str, season: int, week: int):
-    """The history a feature builder is allowed to see for one target row.
+# The three tests below used to assert that `_prior_games`, defined a few lines
+# above them, filtered correctly. They held by construction: a change to
+# gridlib/features.py could not make any of them fail. That is not a
+# hypothetical weakness. `_prior_roll_mean` shipped with no shift(1) at all, so
+# every f_r3_* and f_r8_* feature included the game it was describing, and all
+# 259 tests passed. They now call the production builders.
 
-    Strictly BEFORE the target game. The MLB build shipped this comparison as
-    <= twice; both times a row counted its own game as a prior appearance.
+
+@pytest.mark.parametrize("builder", ["_prior_mean", "_prior_mean_skipna",
+                                     "_prior_roll_mean"])
+def test_builders_never_see_the_current_row(builder):
+    """The canonical leak, tested against the real functions.
+
+    Values are strictly increasing per key, so a builder that includes the
+    current row cannot help but produce a feature at least as large as it. The
+    first row of every key must be NaN: with nothing before it there is no
+    honest answer, and 0 would be a lie the model reads as history.
     """
-    return df[(df["gsis_id"] == gsis_id)
-              & ((df["season"] < season)
-                 | ((df["season"] == season) & (df["week"] < week)))]
+    import numpy as np
+
+    from gridlib import features as F
+
+    fn = getattr(F, builder)
+    df = pd.DataFrame({"k": ["a"] * 5 + ["b"] * 4,
+                       "x": [10.0, 20.0, 30.0, 40.0, 50.0, 7.0, 14.0, 21.0, 28.0]})
+    got = fn(df, "k", "x", 3) if builder == "_prior_roll_mean" else fn(df, "k", "x")
+    got = pd.Series(np.asarray(got, dtype=float), index=df.index)
+
+    for key, g in df.groupby("k", sort=False):
+        vals, feat = g["x"].to_numpy(), got.loc[g.index].to_numpy()
+        assert np.isnan(feat[0]), (
+            f"{builder}: first row of key {key} has history {feat[0]}, but "
+            "nothing precedes it"
+        )
+        later = feat[1:]
+        assert (later[~np.isnan(later)] < vals[1:][~np.isnan(later)]).all(), (
+            f"{builder}: the feature is not strictly below the current value "
+            "on a strictly increasing series, so it contains the current row"
+        )
 
 
-def test_history_excludes_the_target_game(table):
-    """The canonical leak: a row seeing its own game in its history."""
-    sub = table[table["position"] == "WR"].head(2000)
-    row = sub.iloc[len(sub) // 2]
-    hist = _prior_games(table, row["gsis_id"], row["season"], row["week"])
-    assert row["game_id"] not in set(hist["game_id"])
+def test_prior_roll_mean_is_exactly_the_previous_window():
+    """Pinned by value, because 'looks about right' is how this shipped broken.
+
+    [10, 20, 30, 40] with window 3 must give [nan, 10, 15, 20]. It shipped
+    giving [10, 15, 20, 30], the window INCLUDING the current game, and the
+    docstring claimed the shift was there.
+    """
+    import numpy as np
+
+    from gridlib import features as F
+
+    df = pd.DataFrame({"k": ["a"] * 4, "x": [10.0, 20.0, 30.0, 40.0]})
+    got = np.asarray(F._prior_roll_mean(df, "k", "x", 3), dtype=float)
+    assert np.isnan(got[0])
+    assert list(got[1:]) == [10.0, 15.0, 20.0], (
+        f"got {list(got)}; the current-row-inclusive answer is [10, 15, 20, 30]"
+    )
 
 
-def test_history_is_strictly_before_not_up_to(table):
-    """Same week, same season must be excluded, not merely 'not after'."""
-    row = table.iloc[1000]
-    hist = _prior_games(table, row["gsis_id"], row["season"], row["week"])
-    assert (hist["week"] < row["week"]).all() or (hist["season"] < row["season"]).any()
-    same_week = hist[(hist["season"] == row["season"])
-                     & (hist["week"] == row["week"])]
-    assert len(same_week) == 0
+def test_rolling_features_do_not_track_the_current_game(table):
+    """On real data, a leaked window correlates with its own target.
+
+    A 3-game window that includes the current game correlates with that game's
+    outcome at about 0.98 on a monotone series and stays high on real, noisy
+    data. A strictly prior window correlates only as far as the player's form
+    actually persists. This is the end-to-end version of the unit tests above:
+    it runs the whole feature build, so it also catches a caller that undoes
+    the shift.
+    """
+    import numpy as np
+
+    from gridlib import features as F
+
+    from gridlib.cache import dc_path, read_parquet_or_none
+
+    lg = read_parquet_or_none(dc_path("league_season_2016_2025_v1.parquet"))
+    sub = table[table["season"].isin([2023, 2024])]
+    if len(sub) < 2000 or lg is None:
+        pytest.skip("backfill too small, or league table missing")
+    priors = F.league_priors(sub, 2024)
+    feat = F.build(sub, lg, priors)
+    for col, target in (("f_r3_targets", "targets"),
+                        ("f_r3_receiving_yards", "receiving_yards")):
+        if col not in feat.columns:
+            continue
+        d = feat[feat[col].notna() & feat[target].notna()]
+        d = d[d["position"].isin(["WR", "TE"])]
+        if len(d) < 500:
+            continue
+        r = float(np.corrcoef(d[col], d[target])[0, 1])
+        assert r < 0.80, (
+            f"{col} correlates with its own game's {target} at {r:.3f}. A "
+            "strictly prior window tracks form, not the outcome; this is what "
+            "a window containing the current game looks like."
+        )
 
 
 def test_a_players_first_ever_game_has_empty_history(table):
-    """A debut must yield no prior games, not a silent fallback to someone else."""
-    first = table.sort_values(["season", "week"]).groupby("gsis_id").head(1).iloc[0]
-    hist = _prior_games(table, first["gsis_id"], first["season"], first["week"])
-    assert len(hist) == 0
+    """A debut must yield no prior games, not a silent fallback to someone else.
+
+    Tested on the production builder: the first row of each key must be NaN,
+    never 0, so "no history" stays distinguishable from "history of zero".
+    """
+    import numpy as np
+
+    from gridlib import features as F
+
+    sub = table.sort_values(["season", "week"]).head(20000)
+    got = F._prior_mean(sub, "gsis_id", "targets")
+    debuts = sub.groupby("gsis_id", sort=False).head(1).index
+    vals = np.asarray(got.loc[debuts], dtype=float)
+    assert np.isnan(vals).all(), (
+        f"{int((~np.isnan(vals)).sum())} debut rows carry prior history"
+    )
 
 
 def test_rolling_windows_must_count_games_not_weeks(table):

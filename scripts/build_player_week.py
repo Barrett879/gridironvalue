@@ -417,7 +417,18 @@ def build_season(season: int) -> pd.DataFrame | None:
             "stadium_id", "old_game_id", "temp", "wind"]].copy()
     df = df.merge(gm, on="game_id", how="left")
 
-    is_home = df["team"] == df["home_team"]
+    # Canonical on BOTH sides. games.parquet spells the Raiders OAK (2016-2019)
+    # and the Chargers SD (2016) while stats_player_week spells them LV and LAC,
+    # so a raw comparison was False for every Raiders and Chargers row including
+    # their HOME games. 477 player-games that are home games had
+    # team_implied_total and opp_implied_total swapped, rest_days and
+    # opp_rest_days swapped, and team_spread carrying the opposite sign, with a
+    # signed error from -28 to +28. The same rows carry is_home = 1 from the
+    # team_week merge, which is derived from play-by-play and is correct, so the
+    # row contradicted itself: a home game whose spread said the team was a
+    # 3-point underdog when the market had it a 3-point favourite.
+    from gridlib.teams import canonical
+    is_home = df["team"].map(canonical) == df["home_team"].map(canonical)
     df["team_implied_total"] = np.where(is_home, df["home_implied_total"],
                                         df["away_implied_total"])
     df["opp_implied_total"] = np.where(is_home, df["away_implied_total"],

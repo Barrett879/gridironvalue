@@ -346,13 +346,25 @@ def _prior_sum_and_n(df: pd.DataFrame, key: str, col: str):
 def _prior_roll_mean(df: pd.DataFrame, key: str, col: str, window: int) -> pd.Series:
     """Mean over the last `window` STRICTLY prior GAMES (rows), per key.
 
-    shift(1) already excludes the current row, so this never had the leak that
-    `_prior_mean` did, but the fill keeps the two definitions consistent.
+    THE shift(1) IS THE WHOLE FUNCTION. `rolling(window)` includes the current
+    element, so without it `f_r3_targets` for a game is the mean of that game
+    and the two before it, and the model reads this game's own outcome as a
+    feature describing form going into it. On [10, 20, 30, 40] with window 3
+    that returns [10, 15, 20, 30] where the correct answer is
+    [nan, 10, 15, 20], and the feature correlates with the current value at
+    0.98.
+
+    It shipped that way. The docstring here claimed the shift was present while
+    the body had never had it, and the three tests named as guarding the
+    point-in-time property asserted against a helper defined in the test file
+    rather than against this function, so they could not fail. 43 rolling
+    features were in the model. See tests/test_leakage.py, which now calls this
+    function directly.
     """
     filled = df[col].astype(float).fillna(0.0)
     return (
         filled.groupby(df[key], sort=False)
-        .apply(lambda s: s.rolling(window, min_periods=1).mean())
+        .apply(lambda s: s.shift(1).rolling(window, min_periods=1).mean())
         .reset_index(level=0, drop=True)
     )
 

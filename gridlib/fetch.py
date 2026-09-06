@@ -746,6 +746,8 @@ def depth_chart_normalized(season: int) -> pd.DataFrame:
     knowable then, not as gospel. The rank itself is a roster ordering, not an
     outcome, so the leak is mild, but it is real and worth naming.
     """
+    from .teams import canonical
+
     dc = load_depth_charts(season)
     if dc is None or dc.empty:
         logger.warning("no depth chart for %d", season)
@@ -781,6 +783,16 @@ def depth_chart_normalized(season: int) -> pd.DataFrame:
         return pd.DataFrame(columns=["season", "week", "team", "gsis_id",
                                      "position", "depth_rank"])
     out["season"] = season
+    # Canonicalize, because the depth-chart files and the stats files disagree
+    # about relocated franchises: depth_charts_2016 spells the Raiders OAK and
+    # the Chargers SD, stats_player_week_2016 spells them LV and LAC. Every
+    # consumer joins these two on `team`, so without this the join matched
+    # nothing for those franchises: 998 player-weeks (LV 2016-2019, LAC 2016)
+    # had depth_rank null at a rate of exactly 1.000 while every other team ran
+    # 0.90 to 0.98. `is_starter` is (depth_rank_capped == 1), and NaN == 1 is
+    # False, so 127 quarterback games with 20+ pass attempts, Derek Carr and
+    # Philip Rivers among them, trained as non-starters.
+    out["team"] = out["team"].map(canonical)
     out["depth_rank"] = pd.to_numeric(out["depth_rank"], errors="coerce")
     out["week"] = pd.to_numeric(out["week"], errors="coerce")
     out = out[out["week"].notna()]

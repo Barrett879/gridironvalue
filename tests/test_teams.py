@@ -128,3 +128,47 @@ def test_distinguish_never_raises_on_unknowns():
     from gridlib.teams import distinguish
     assert len(distinguish("ZZZ", "QQQ")) == 2
     assert len(distinguish(None, None)) == 2
+
+
+def test_depth_chart_uses_canonical_team_codes():
+    """The depth-chart files and the stats files disagree about relocations.
+
+    depth_charts_2016 spells the Raiders OAK and the Chargers SD;
+    stats_player_week_2016 spells them LV and LAC. Everything joins the two on
+    `team`, so an uncanonicalized chart matched nothing for those franchises.
+    """
+    from gridlib import fetch
+
+    dc = fetch.depth_chart_normalized(2016)
+    if dc is None or dc.empty:
+        pytest.skip("2016 depth chart not cached")
+    stale = sorted({"OAK", "SD", "STL"} & set(dc["team"]))
+    assert not stale, f"relocated franchises left uncanonical: {stale}"
+    assert {"LV", "LAC"} <= set(dc["team"]), (
+        "the Raiders and Chargers vanished from the 2016 chart entirely, which "
+        "is worse than the mismatch this replaced"
+    )
+
+
+def test_no_franchise_loses_its_depth_rank_entirely():
+    """A team-season with a 100% null depth_rank is a join that matched nothing.
+
+    Measured before the fix: LV 2016-2019 and LAC 2016 ran at exactly 1.000
+    while every other team ran 0.90 to 0.98. `is_starter` is
+    `(depth_rank_capped == 1)` and `NaN == 1` is False, so 127 quarterback games
+    with 20 or more pass attempts, Derek Carr and Philip Rivers among them,
+    trained as non-starters. Both `depth_rank_capped` and `is_starter` are model
+    features.
+    """
+    from gridlib.cache import dc_path, read_parquet_or_none
+
+    pw = read_parquet_or_none(dc_path("player_week_2016_2025_v1.parquet"))
+    if pw is None or pw.empty:
+        pytest.skip("backfill not built")
+    rate = (pw.groupby(["season", "team"])["depth_rank"]
+              .apply(lambda s: float(s.isna().mean())))
+    dead = rate[rate > 0.99]
+    assert dead.empty, (
+        "these team-seasons have no depth rank at all, so the join matched "
+        f"nothing for them:\n{dead.to_string()}"
+    )
