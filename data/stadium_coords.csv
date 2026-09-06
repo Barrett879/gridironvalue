@@ -1,0 +1,48 @@
+stadium_id,lat,lon,venue
+NYC01,40.8135,-74.0745,MetLife Stadium
+LAX01,33.9535,-118.3392,SoFi Stadium
+KAN00,39.0489,-94.4839,Arrowhead Stadium
+PHI00,39.9008,-75.1675,Lincoln Financial Field
+BOS00,42.0909,-71.2643,Gillette Stadium
+BUF00,42.7738,-78.7870,Highmark Stadium
+HOU00,29.6847,-95.4107,NRG Stadium
+BAL00,39.2780,-76.6227,M&T Bank Stadium
+TAM00,27.9759,-82.5033,Raymond James Stadium
+PIT00,40.4468,-80.0158,Acrisure Stadium
+PHO00,33.5276,-112.2626,State Farm Stadium
+NOR00,29.9511,-90.0812,Caesars Superdome
+GNB00,44.5013,-88.0622,Lambeau Field
+SEA00,47.5952,-122.3316,Lumen Field
+DET00,42.3400,-83.0456,Ford Field
+DAL00,32.7473,-97.0945,AT&T Stadium
+SFO01,37.4033,-121.9694,Levi's Stadium
+DEN00,39.7439,-105.0201,Empower Field at Mile High
+CHI98,41.8623,-87.6167,Soldier Field
+MIN01,44.9738,-93.2578,U.S. Bank Stadium
+NAS00,36.1665,-86.7713,Nissan Stadium
+IND00,39.7601,-86.1639,Lucas Oil Stadium
+CIN00,39.0955,-84.5161,Paycor Stadium
+CAR00,35.2258,-80.8528,Bank of America Stadium
+MIA00,25.9580,-80.2389,Hard Rock Stadium
+WAS00,38.9076,-76.8645,Northwest Stadium
+CLE00,41.5061,-81.6995,Huntington Bank Field
+JAX00,30.3239,-81.6373,EverBank Stadium
+ATL97,33.7554,-84.4008,Mercedes-Benz Stadium
+VEG00,36.0909,-115.1833,Allegiant Stadium
+LAX99,34.0141,-118.2879,Los Angeles Memorial Coliseum
+OAK00,37.7516,-122.2005,Oakland Coliseum
+LAX97,33.8644,-118.2611,Dignity Health Sports Park
+LON00,51.5560,-0.2795,Wembley Stadium
+LON02,51.6043,-0.0665,Tottenham Hotspur Stadium
+LON01,51.4560,-0.3417,Twickenham Stadium
+ATL00,33.7576,-84.4009,Georgia Dome
+SDG00,32.7809,-117.1194,Qualcomm Stadium
+MEX00,19.3029,-99.1505,Estadio Azteca
+GER00,48.2188,11.6247,Allianz Arena
+MUN01,48.2188,11.6247,Allianz Arena
+FRA00,50.0686,8.6455,Deutsche Bank Park
+PAR00,48.9245,2.3601,Stade de France
+RIO00,-22.9121,-43.2302,Maracana
+SAO00,-23.5453,-46.4742,Arena Corinthians
+MEL00,-37.8200,144.9834,Melbourne Cricket Ground
+MAD01,40.4531,-3.6883,Santiago Bernabeu

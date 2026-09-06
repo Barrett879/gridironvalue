@@ -28,6 +28,10 @@ cache/*
 !cache/prob_calibration_v1.parquet
 !cache/mean_calibration_v1.parquet
 
+# Per-game weather from Open-Meteo. Committed because refetching it is 364 API
+# calls against a free service, and because the backfill build reads it.
+!cache/weather_2016_2026_v1.parquet
+
 # The CURRENT season, rebuilt and committed weekly by .github/workflows/weekly.yml.
 # Without it the deployed site projects mid-season as if the season had not
 # started, because the ten-year backfill above is frozen and ends in 2025.

@@ -443,6 +443,26 @@ def build_season(season: int) -> pd.DataFrame | None:
     else:
         df["referee"] = pd.NA
 
+    # ── Weather at kickoff ──
+    # `schedules.parquet` carries temp and wind and BOTH ARE POSTGAME: 66.7%
+    # populated for 2025's completed games, 0% for 2026's unplayed ones, which
+    # is why they sit in columns.POSTGAME_TRAP. These come from Open-Meteo
+    # instead (scripts/build_weather.py), which covers the whole backfill and
+    # can be forecast for an upcoming game.
+    #
+    # Raw wind moves scoring hard: combined points fall from 46.4 under 6mph to
+    # 41.4 at 12-18mph across 2016-2025. Whether it moves a PROJECTION is a
+    # different question, because the model already sees the Vegas total and
+    # Vegas prices weather. That is what the ablation is for.
+    _wx = read_parquet_or_none(dc_path("weather_2016_2026_v1.parquet"))
+    if _wx is not None and not _wx.empty:
+        _wx = _wx.drop(columns=[c for c in ("stadium_id",) if c in _wx.columns])
+        df = df.merge(_wx, on="game_id", how="left")
+    else:
+        for c in ("wx_temp", "wx_wind", "wx_gust", "wx_wind_max",
+                  "wx_gust_max", "wx_precip"):
+            df[c] = np.nan
+
     # ── Venue and schedule context ──
     # The football analog of park factors and day-versus-night. All of it is
     # knowable weeks ahead, and none of it was encoded: roof_type and surface

@@ -222,6 +222,37 @@ POSDEF_EXCLUDE_TARGETS = frozenset({
 # The strategy document's section 3 and the last rich unused source. Built as
 # STRICTLY PRIOR-SEASON, league-relative rates; see add_def_scheme for why
 # both of those are load-bearing rather than stylistic.
+# Weather at kickoff, from Open-Meteo. Under test.
+#
+# Masked to OUTDOOR games: a dome has no weather, and feeding it 0mph would say
+# "perfectly calm" when the truth is "not applicable". NaN is the honest value
+# and the tree already knows the game is indoors from `roof_indoor`, so the
+# NaN pattern carries no information the model does not have.
+# REJECTED, and the most instructive rejection of the programme because the raw
+# effect is so large and so obviously real.
+#
+# Wind moves scoring hard: across 2016-2025 outdoor games, combined points fall
+# from 46.4 under 6mph to 41.4 at 12-18mph. Anyone would ship that.
+#
+# It gains the model almost nothing: mean +0.16% validation, +0.06% test, with
+# FOUR replicated regressions (carries, carries::rank1, rushing_yards::rank1,
+# targets) against seven mostly-tiny improvements. Inside noise.
+#
+# WHY, and this is the useful part. The model already sees the Vegas total, and
+# Vegas prices wind: the posted total falls from 45.1 in calm air to 42.6 above
+# 18mph. Vegas does not price it FULLY - games in 12-18mph wind land 2.5 points
+# UNDER the total against +1.3 in calm air, a ~3.8 point swing on ~1,000 games -
+# so there is genuinely something the market misses. But it is a GAME-level
+# residual of a couple of points, and divided across twenty-two players it does
+# not survive as a per-player signal.
+#
+# The lesson generalises: a large effect on the game is not a usable effect on a
+# stat line, and a feature the market has already absorbed adds nothing even
+# when the underlying physics is undeniable.
+USE_WEATHER = False
+WEATHER_FEATURES = ["wx_temp", "wx_wind", "wx_gust", "wx_wind_max",
+                    "wx_gust_max", "wx_precip"]
+
 USE_SCHEME = False
 
 # Referee crew tendencies. Availability is the constraint: see
@@ -446,6 +477,28 @@ def _scheme_table() -> pd.DataFrame:
             )
         _SCHEME_CACHE["df"] = t
     return _SCHEME_CACHE["df"]
+
+
+def mask_indoor_weather(df: pd.DataFrame) -> pd.DataFrame:
+    """Blank the weather for games played under a roof.
+
+    A dome game has real weather outside and none of it reaches the field, so
+    the honest value is MISSING, not the 72 degrees and 4mph that happen to be
+    outside. Leaving the real reading in would ask the model to learn "ignore
+    this column when roof_indoor is not zero", which it can do but should not
+    have to, and which it would learn imperfectly from the 15% of games that are
+    indoors.
+
+    The resulting NaN pattern is exactly `roof_indoor != 0`, which is already a
+    feature, so this leaks nothing the model does not have.
+    """
+    out = df.copy()
+    have = [c for c in WEATHER_FEATURES if c in out.columns]
+    if not have or "roof_indoor" not in out.columns:
+        return out
+    indoor = pd.to_numeric(out["roof_indoor"], errors="coerce").fillna(0) > 0
+    out.loc[indoor, have] = np.nan
+    return out
 
 
 def add_def_scheme(df: pd.DataFrame) -> pd.DataFrame:
@@ -753,6 +806,8 @@ def build(df: pd.DataFrame, league_by_season: pd.DataFrame,
     out = add_share_history(out)
     if USE_POSITIONAL_DEF:
         out = add_positional_defense(out)
+    if USE_WEATHER:
+        out = mask_indoor_weather(out)
     if USE_SCHEME:
         out = add_def_scheme(out)
     if USE_REFEREE:
@@ -790,6 +845,8 @@ def feature_columns(df: pd.DataFrame, target: str | None = None) -> list[str]:
         NON_NUMERIC |= set(BIO_FEATURES)
     if not USE_VENUE:
         NON_NUMERIC |= set(VENUE_FEATURES)
+    if not USE_WEATHER:
+        NON_NUMERIC |= set(WEATHER_FEATURES)
     hist = [c for c in df.columns if c.startswith("f_")]
     # The DVP block is `f_`-prefixed history, so it is excluded here rather than
     # through NON_NUMERIC, which only covers the pregame block.

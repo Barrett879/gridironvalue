@@ -121,6 +121,12 @@ PREGAME = frozenset({
     # Carried as a NAME and never used as a feature directly; the feature
     # layer turns it into the crew's prior-season tendencies.
     "referee",
+    # Weather. PREGAME, but only because it comes from a FORECAST feed rather
+    # than from schedules.parquet, whose temp and wind are postgame and live in
+    # POSTGAME_TRAP below. Note the asymmetry this creates and do not forget it:
+    # training values are OBSERVED weather, serving values are FORECAST weather,
+    # so the ablation measures a slightly easier problem than the live one.
+    "wx_temp", "wx_wind", "wx_gust", "wx_wind_max", "wx_gust_max", "wx_precip",
 })
 
 # NextGen Stats are SAME-GAME measurements. A receiver's average separation in

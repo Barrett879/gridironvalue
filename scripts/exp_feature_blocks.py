@@ -65,6 +65,8 @@ BLOCKS = {
     "scheme": "USE_SCHEME",
     "refcrew": "USE_REFEREE",
     "pfradv": "USE_PFR",
+    # Round 4.
+    "weather": "USE_WEATHER",
 }
 
 # Blocks that have already passed the gate. `--base` puts them in BOTH the
