@@ -930,6 +930,20 @@ def compare(lines: pd.DataFrame, proj: pd.DataFrame,
         p_over = float("nan")
         if kind == "mean" and len(cols) == 1 and cols[0] not in ("__fantasy__",):
             p_over = _uncertainty().prob_over(cols[0], model_val, line_val)
+        # SHOW THE MEDIAN, not the mean, wherever a distribution exists.
+        # The lean is decided by the median (More exactly when P(over) > 0.5),
+        # so printing the mean beside the line produced rows that contradicted
+        # themselves: "MODEL 4.8, LINE 4.5, LEAN Less". Both numbers were right
+        # and the row was unreadable. With the median, MODEL > LINE and "More"
+        # are the same statement and the contradiction cannot occur.
+        #
+        # `model_val` stays the MEAN above, because the ratio distribution is
+        # defined against it and P(over) must keep being computed from it.
+        if kind == "mean" and np.isfinite(p_over):
+            _med = _uncertainty().median_projection(cols[0], model_val)
+            if np.isfinite(_med):
+                model_val = _med
+                diff = model_val - compare_to
         if kind == "mean" and np.isfinite(p_over):
             # THE LEAN COMES FROM THE PROBABILITY, not the gap, wherever one
             # exists. Measured on 2024: the gap rule leaned More on 66% of

@@ -855,7 +855,7 @@ def render_footer() -> None:
         "</div>"
         '<div class="gv-foot-rule"></div>'
         '<div class="gv-foot-bottom">'
-        f"<div>&copy; {year} {SITE_NAME}. Every number is an expected value.</div>"
+        f"<div>&copy; {year} {SITE_NAME}. Every number is a modelled outcome, not a forecast.</div>"
         '<div><a href="/About" target="_self">About</a></div>'
         "</div></div>"
     )

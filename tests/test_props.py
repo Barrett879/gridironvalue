@@ -226,11 +226,14 @@ def _lines(stat="Pass Yards", line=245.5):
 
 
 def test_compare_computes_the_gap_and_the_lean():
+    """The displayed number is the MEDIAN, so this pins the RELATIONSHIP rather
+    than the old hardcoded mean: the gap is model minus line, and the lean
+    agrees with their comparison."""
     table, meta = props.compare(_lines(), _proj())
     assert meta["matched"] == 1
     r = table.iloc[0]
-    assert r["model"] == pytest.approx(230.8)
-    assert r["diff"] == pytest.approx(-14.7)
+    assert r["diff"] == pytest.approx(r["model"] - r["line"], abs=0.01)
+    assert (r["lean"] == "Less") == (r["model"] < r["line"])
     assert r["lean"] == "Less"
 
 
@@ -887,10 +890,14 @@ def test_lean_follows_the_probability_not_the_gap():
                            "line": 58.5, "odds_type": "standard", "direction": None}])
     table, _ = props.compare(lines, proj)
     row = table.iloc[0]
-    assert row["model"] > row["line"], "setup: the gap should say More"
+    # The MEAN (60.0) is above the line (58.5), which is what the old gap rule
+    # would have leaned More on. The displayed value is now the median, so the
+    # check is that the lean follows P(over) computed from the mean.
+    assert 60.0 > row["line"], "setup: the mean should be above the line"
     assert row["p_over"] is not None
     if row["p_over"] < 0.5:
         assert row["lean"] == "Less", "lean followed the gap instead of P(Over)"
+        assert row["model"] < row["line"], "median should agree with the lean"
 
 
 def test_combination_props_have_no_probability_and_still_work():
@@ -1023,3 +1030,47 @@ def test_writes_work_when_not_read_only(tmp_path, monkeypatch):
     monkeypatch.setattr(C, "READ_ONLY", False)
     assert props.freeze_projections(2026, 4, _frozen_table(), "v") == 1
     assert props.load_frozen(2026, 4) is not None
+
+
+# ── A row must never contradict itself ──────────────────────────────────────
+def test_a_row_never_contradicts_itself():
+    """MODEL vs LINE must agree with LEAN, always.
+
+    The lean is decided by the median (More exactly when P(over) > 0.5), so
+    displaying the MEAN beside the line produced rows reading "MODEL 4.8,
+    LINE 4.5, LEAN Less". Both numbers were correct and the row was unreadable.
+    On the real 2026 week 1 board that was ~84 of 701 priced rows.
+    """
+    from gridlib import uncertainty as U
+    if not U.available():
+        pytest.skip("calibration artifact not built")
+    proj = _proj()
+    proj["receiving_yards"] = 36.0
+    proj["position"] = "WR"
+    lines = pd.DataFrame([{"name": "Patrick Mahomes", "stat_type": "Receiving Yards",
+                           "line": 34.5, "odds_type": "standard", "direction": None}])
+    table, _ = props.compare(lines, proj)
+    r = table.iloc[0]
+    if r["kind"] != "mean" or r["p_over"] is None:
+        pytest.skip("no distribution for this row")
+    assert (r["model"] > r["line"]) == (r["lean"] == "More"), (
+        f"row contradicts itself: model {r['model']} vs line {r['line']} "
+        f"but lean {r['lean']}")
+
+
+def test_displayed_value_is_the_median_not_the_mean():
+    """Pins WHICH number is shown. Reverting to the mean would silently bring
+    back the self-contradicting rows."""
+    from gridlib import uncertainty as U
+    if not U.available():
+        pytest.skip("calibration artifact not built")
+    mean = 36.0
+    med = U.median_projection("receiving_yards", mean)
+    assert med == med and med < mean, "receiving yards should be right-skewed"
+    proj = _proj()
+    proj["receiving_yards"] = mean
+    proj["position"] = "WR"
+    lines = pd.DataFrame([{"name": "Patrick Mahomes", "stat_type": "Receiving Yards",
+                           "line": 34.5, "odds_type": "standard", "direction": None}])
+    table, _ = props.compare(lines, proj)
+    assert abs(float(table.iloc[0]["model"]) - med) < 0.05

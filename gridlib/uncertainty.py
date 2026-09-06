@@ -196,6 +196,49 @@ def prob_over(target: str, pred: float, line: float) -> float:
     return float(min(CEIL, max(FLOOR, p)))
 
 
+def median_projection(target: str, pred: float) -> float:
+    """The MEDIAN outcome for a projection whose mean is `pred`.
+
+    WHY THE BOARD SHOWS THIS AND NOT THE MEAN
+    ------------------------------------------
+    A prop line is a 50/50 question, so the lean is decided by the median: the
+    model says More exactly when P(actual > line) > 0.5, which is exactly when
+    the median exceeds the line.
+
+    Printing the MEAN beside the line broke that. These stats are right-skewed,
+    so the mean sits above the median (receiving yards: the median is 0.68 to
+    0.90 of the mean), and any line falling between the two produced a row that
+    contradicted itself: "MODEL 4.8, LINE 4.5, LEAN Less". The numbers were each
+    correct and the row was unreadable.
+
+    Showing the median makes MODEL > LINE and "More" the same statement, so the
+    contradiction cannot occur rather than merely being explainable. Passing
+    yards is nearly symmetric (0.97 to 1.04), which is why QB rows rarely showed
+    the problem and skill rows showed it constantly.
+
+    The MEAN is still what the models estimate and still what aggregates and the
+    coherence checks use. This is a display choice for the one place a
+    projection is compared to a posted number.
+    """
+    if pred is None:
+        return float("nan")
+    try:
+        pred = float(pred)
+    except (TypeError, ValueError):
+        return float("nan")
+    if not np.isfinite(pred) or pred < MIN_PRED:
+        return float("nan")
+    row = _row_for(target, pred)
+    if row is None:
+        return float("nan")
+    qs = np.asarray(row["quantiles"], dtype=float)
+    grid = np.asarray(row["q_grid"], dtype=float)
+    if qs.size == 0 or qs.size != grid.size:
+        return float("nan")
+    ratio = float(np.interp(0.5, grid, qs))
+    return float(max(0.0, pred * ratio))
+
+
 def prob_series(targets, preds, lines) -> np.ndarray:
     """Vectorised convenience wrapper. Same semantics, row by row."""
     return np.array([prob_over(t, p, l)
