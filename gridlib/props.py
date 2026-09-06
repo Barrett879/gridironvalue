@@ -906,7 +906,7 @@ def compare(lines: pd.DataFrame, proj: pd.DataFrame,
 
     meta = {"posted": int(len(lines)), "refused": {}, "unmatched_players": 0,
             "unmapped_stats": {}, "matched": 0, "low_confidence": 0,
-            "baseline_served": 0}
+            "baseline_served": 0, "unprojected_stat": 0}
     if lines.empty or proj.empty:
         meta["reason"] = ("no lines pasted" if lines.empty
                           else "no projections for this week")
@@ -950,6 +950,7 @@ def compare(lines: pd.DataFrame, proj: pd.DataFrame,
             pairs = list(zip(cols[1::2], cols[2::2]))
             vals = [p.get(c_) for c_, _ in pairs]
             if any(v is None or pd.isna(v) for v in vals):
+                meta["unprojected_stat"] += 1
                 continue
             model_val = sum(float(v) * float(w) for v, (_, w) in zip(vals, pairs))
             src = "model_low_confidence"
@@ -958,6 +959,10 @@ def compare(lines: pd.DataFrame, proj: pd.DataFrame,
             lam = sum(float(v) for v in parts
                       if v is not None and pd.notna(v))
             if lam <= 0:
+                # No projected rate for any component, so there is no
+                # distribution to take a probability from. Counted, not
+                # dropped in silence.
+                meta["unprojected_stat"] += 1
                 continue
             model_val = poisson_at_least(lam, threshold_for_line(line_val))
             kind, compare_to = "probability", 0.5
@@ -970,7 +975,14 @@ def compare(lines: pd.DataFrame, proj: pd.DataFrame,
         else:
             vals = [p.get(c) for c in cols]
             if any(v is None or pd.isna(v) for v in vals):
-                meta["unmatched_players"] += 0  # matched player, unprojected stat
+                # A DIFFERENT case from an unmatched player: this player is on
+                # the board, we just have no projection for this stat (a kicker
+                # with a receiving line, a target whose model failed the gate
+                # for his position). It had `+= 0` here with a comment saying
+                # so, which counts nothing, so these rows left the table with
+                # no counter anywhere. 77 of 1325 posted lines disappeared that
+                # way and the reader was told about none of them.
+                meta["unprojected_stat"] += 1
                 continue
             model_val = float(sum(float(v) for v in vals)) * float(scale)
             srcs = {sources.get(c, "model") for c in cols}

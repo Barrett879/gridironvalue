@@ -78,12 +78,15 @@ average and says so.
 assumes the player plays. Among players with eight or more appearances in a
 season, 74% miss at least one game and half miss three or more, so roughly 17%
 of the slots a weekly board is asked about are players who will not be on the
-field. Until an availability model exists, read every line as "if he plays".
+field. There is now an availability model, and team totals are multiplied
+through it, but a player prop is still a conditional number: read every line as
+"if he plays".
 
 <br><br><b>What it deliberately will not price.</b> Longest reception, longest
 rush, longest completion and longest field goal are maxima over plays, not
-means, and a mean-projection model cannot price a maximum. Those are refused by
-name rather than filled with a confidently wrong number.
+central values, and a model that projects a per-game central value cannot price
+a maximum. Those are refused by name rather than filled with a confidently
+wrong number.
 
 </div>
 """, unsafe_allow_html=True)

@@ -1291,3 +1291,134 @@ def test_save_lines_refuses_on_the_published_deployment(monkeypatch):
     assert after == before, (
         "save_lines wrote to the shared committed board under READ_ONLY"
     )
+
+
+def test_every_posted_line_is_accounted_for():
+    """A line that leaves compare() without a counter cannot be explained.
+
+    The board tells the reader how many lines were saved and then shows fewer.
+    Every one of the missing must land in exactly one bucket, or the difference
+    is unexplainable and reads as the site being broken.
+
+    Three `continue` paths dropped rows silently. One of them was literally
+    `meta["unmatched_players"] += 0` with a comment saying it was a different
+    case. 77 of 1325 posted lines disappeared with no counter anywhere.
+    """
+    from gridlib import predict, props
+
+    lines = props.load_lines(2026, 1)
+    proj = predict.project_week_cached(2026, 1)
+    if lines is None or lines.empty or proj is None or proj.empty:
+        pytest.skip("no committed board or projection for 2026 week 1")
+
+    _table, meta = props.compare(lines, proj, predict.load_registry())
+    accounted = (meta["matched"] + meta["unmatched_players"]
+                 + meta["unprojected_stat"] + sum(meta["refused"].values())
+                 + sum(meta["unmapped_stats"].values()))
+    assert accounted == meta["posted"], (
+        f"{meta['posted'] - accounted} of {meta['posted']} posted lines left "
+        f"compare() without a counter. Buckets: {meta['matched']} matched, "
+        f"{meta['unmatched_players']} unmatched players, "
+        f"{meta['unprojected_stat']} unprojected stat, "
+        f"{sum(meta['refused'].values())} refused, "
+        f"{sum(meta['unmapped_stats'].values())} unmapped"
+    )
+
+
+def test_rank_by_reliability_orders_by_tier_then_confidence():
+    """The board's entire ordering, which had no test at all.
+
+    Reversing the sort changed nothing in the suite. Two properties matter and
+    both are easy to break silently:
+
+    TIER FIRST. Sorting by gap size alone puts the least trustworthy stats at
+    the top, which is the opposite of useful.
+
+    CONFIDENCE SECOND, not gap size. The gap is wrong twice over: biased on
+    right-skewed stats, where a big positive gap can still sit under a coin
+    flip, and not comparable across stats, since seven yards and half a
+    reception sorted as 7.0 against 0.5.
+    """
+    from gridlib import props
+
+    tiers = list(props.TIER_ORDER)
+    best, worst = tiers[0], tiers[-1]
+    table = pd.DataFrame([
+        # a huge GAP in the worst tier must not outrank the good tier
+        {"tier": worst, "p_over": 0.99, "kind": "mean", "diff_pct": 400.0,
+         "model": 90.0, "tag": "worst_tier_huge_gap"},
+        {"tier": best, "p_over": 0.55, "kind": "mean", "diff_pct": 1.0,
+         "model": 10.0, "tag": "best_tier_small_edge"},
+        {"tier": best, "p_over": 0.80, "kind": "mean", "diff_pct": 2.0,
+         "model": 11.0, "tag": "best_tier_big_edge"},
+    ])
+    got = props.rank_by_reliability(table)["tag"].tolist()
+    assert got[0] == "best_tier_big_edge", f"order was {got}"
+    assert got[1] == "best_tier_small_edge", f"order was {got}"
+    assert got[2] == "worst_tier_huge_gap", (
+        f"a worst-tier row outranked the good tier: {got}"
+    )
+
+    # Confidence is distance from a coin flip, so a strong LESS lean ranks with
+    # a strong MORE lean, not below every More.
+    two = pd.DataFrame([
+        {"tier": best, "p_over": 0.52, "kind": "mean", "diff_pct": 9.0,
+         "model": 10.0, "tag": "weak_more"},
+        {"tier": best, "p_over": 0.10, "kind": "mean", "diff_pct": 1.0,
+         "model": 10.0, "tag": "strong_less"},
+    ])
+    assert props.rank_by_reliability(two)["tag"].tolist()[0] == "strong_less", (
+        "a 0.10 probability is a strong lean; it must outrank a 0.52 coin flip "
+        "with a bigger raw gap"
+    )
+
+    # A probability prop's own value IS the probability.
+    prob = pd.DataFrame([
+        {"tier": best, "p_over": np.nan, "kind": "probability", "diff_pct": 0.0,
+         "model": 0.50, "tag": "coinflip"},
+        {"tier": best, "p_over": np.nan, "kind": "probability", "diff_pct": 0.0,
+         "model": 0.93, "tag": "confident"},
+    ])
+    assert props.rank_by_reliability(prob)["tag"].tolist()[0] == "confident"
+
+
+def test_feature_columns_excludes_per_target_and_never_leaks():
+    """feature_columns() was untested; the per-target tests only read the
+    committed registry JSON, so they described a past decision rather than
+    checking the function that makes it."""
+    from gridlib import columns as C
+    from gridlib import features as F
+    from gridlib.cache import dc_path, read_parquet_or_none
+
+    pw = read_parquet_or_none(dc_path("player_week_2016_2025_v1.parquet"))
+    lg = read_parquet_or_none(dc_path("league_season_2016_2025_v1.parquet"))
+    if pw is None or lg is None:
+        pytest.skip("backfill not built")
+    sub = pw[pw["season"].isin([2024, 2025])]
+    feat = F.build(sub, lg, F.league_priors(sub, 2025))
+
+    base = F.feature_columns(feat)
+    assert len(base) > 50, "the feature set collapsed"
+
+    # Nothing a model may not see, whatever the target. Classified against the
+    # BACKFILL's columns: the contract describes the source table, and the
+    # derived f_* columns on the built frame are not in it by design.
+    forbidden = set(C.leaky_columns(sub.columns))
+    for target in (None, "passing_yards", "receiving_yards"):
+        cols = F.feature_columns(feat, target) if target else base
+        leaky = forbidden & set(cols)
+        assert not leaky, f"feature_columns({target!r}) returned {sorted(leaky)}"
+
+    # The per-target exclusion actually excludes, and only for its own targets.
+    if F.POSDEF_EXCLUDE_TARGETS:
+        excluded_target = sorted(F.POSDEF_EXCLUDE_TARGETS)[0]
+        got = F.feature_columns(feat, excluded_target)
+        assert len(got) < len(base), (
+            f"{excluded_target} is listed for exclusion but its feature set is "
+            "the same size as the default one, so the exclusion is not wired in"
+        )
+        keeper = "receiving_yards"
+        if keeper not in F.POSDEF_EXCLUDE_TARGETS:
+            assert len(F.feature_columns(feat, keeper)) == len(base), (
+                "an exclusion meant for one target changed another's set"
+            )

@@ -307,6 +307,10 @@ def render_board(scope_proj: pd.DataFrame, season: int, week: int,
             if meta["unmatched_players"]:
                 bits.append(f"{meta['unmatched_players']} lines name a player "
                             "who is not on a projected depth chart this week")
+            if meta.get("unprojected_stat"):
+                bits.append(f"{meta['unprojected_stat']} lines are for a "
+                            "player we do project, but for a stat we do not "
+                            "project for his position")
             if meta["unmapped_stats"]:
                 bits.append("unmapped stats: " + ", ".join(
                     f"{esc(k)} ({v})"

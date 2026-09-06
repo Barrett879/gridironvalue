@@ -850,8 +850,9 @@ def render_footer() -> None:
         'target="_blank" rel="noopener">CC BY-SA 4.0</a>. '
         f"{SITE_NAME} is an informational analytics site. It is not a "
         "sportsbook, it accepts no wagers, and it offers no betting advice. "
-        "Every number shown is the mean of a modelled distribution, not a "
-        "forecast of what will happen."
+        "Every number shown is a modelled central value, not a forecast of "
+        "what will happen. Player projections are medians: half of that "
+        "player's outcomes in that spot land above the number and half below."
         "</div>"
         '<div class="gv-foot-rule"></div>'
         '<div class="gv-foot-bottom">'
