@@ -597,16 +597,16 @@ def lines_path(season: int, week: int):
 
 
 def save_lines(season: int, week: int, lines: pd.DataFrame) -> None:
-    """Persist a pasted board. A no-op on a read-only deployment.
+    """Persist a pasted board.
 
-    Silently writing on a host without a disk is worse than not writing: the
-    board would show, then vanish on the next restart, and the deployed record
-    would quietly disagree with the committed one.
+    This writes even on a host with no persistent disk, where the file lives
+    only until the next restart. That is deliberate and it is what DiamondValue
+    does: a temporary board is still worth showing, and losing it later costs
+    nothing that was not already going to be re-pasted.
+
+    What must NOT happen on such a host is freezing, which is guarded in
+    `freeze_projections`. The board is a view; the record is evidence.
     """
-    from .cache import READ_ONLY
-    if READ_ONLY:
-        logger.info("read-only deployment; not persisting pasted lines")
-        return
     payload = {
         "season": season, "week": week,
         "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -674,9 +674,12 @@ def freeze_projections(season: int, week: int, table: pd.DataFrame,
     """
     from .cache import READ_ONLY
     if READ_ONLY:
-        # The record is a committed artifact on a read-only host. Freezing here
-        # would stamp a snapshot with whatever model this container loaded and
-        # then lose it, which is exactly the drift freezing exists to prevent.
+        # Pasting is allowed on a read-only host; FREEZING is not. A snapshot
+        # taken here would be stamped with whatever model this container loaded,
+        # would be lost at the next restart, and in the meantime would make the
+        # published record disagree with the committed one. The record only ever
+        # changes through a commit, which is what makes it evidence rather than
+        # whatever the last visitor happened to paste.
         return 0
     if table is None or table.empty:
         return 0

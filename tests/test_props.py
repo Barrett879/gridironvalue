@@ -990,21 +990,23 @@ def test_shrink_is_actually_applied():
 
 
 # ── Read-only deployments must not write the record ─────────────────────────
-def test_readonly_refuses_to_save_lines(tmp_path, monkeypatch):
-    """A published host with no disk would save, show the board, and lose it on
-    the next restart, leaving the live record silently different from the
-    committed one. Refusing is the only honest option."""
+def test_readonly_still_accepts_a_pasted_board(tmp_path, monkeypatch):
+    """Pasting IS allowed on a host with no disk. The board is a view: it shows
+    for a while and clears on restart, which is what DiamondValue does and is
+    fine. Only the RECORD is protected."""
     import gridlib.cache as C
     monkeypatch.setattr(props, "dc_path", lambda name: tmp_path / name)
     monkeypatch.setattr(C, "READ_ONLY", True)
     props.save_lines(2026, 4, pd.DataFrame([{"name": "x", "stat_type": "Pass Yards",
                                              "line": 1.0}]))
-    assert props.load_lines(2026, 4) is None
+    assert props.load_lines(2026, 4) is not None
 
 
 def test_readonly_refuses_to_freeze(tmp_path, monkeypatch):
-    """Freezing on a read-only host would stamp a snapshot with whatever model
-    that container happened to load, then lose it."""
+    """The record is the one thing a published host must not write. A snapshot
+    taken there carries that container's model, dies at the next restart, and
+    until then makes the published record disagree with the committed one. This
+    is what stops a visitor's paste from moving the accuracy record."""
     import gridlib.cache as C
     monkeypatch.setattr(props, "dc_path", lambda name: tmp_path / name)
     monkeypatch.setattr(C, "READ_ONLY", True)

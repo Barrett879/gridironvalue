@@ -489,16 +489,13 @@ def render_input(season: int, week: int) -> None:
     inside popovers, and this renders inside one.
     """
     if _read_only():
-        # Say it plainly rather than accepting a paste that will not survive.
-        # This deployment has no persistent disk, so the record is maintained
-        # in the repository and served here read-only.
         st.info(
-            "This is the published board, and it does not accept pasted lines. "
-            "The lines and the accuracy record below are published with the "
-            "site, so they are the same for everyone and cannot be changed from "
-            "here. New weeks are added when the site is updated."
+            "Paste a board here and it will show for a while, then clear when "
+            "the site restarts. That is fine for looking at a slate. The "
+            "accuracy record is separate: it only changes when the site is "
+            "updated, so it stays the same for everyone and cannot be moved by "
+            "anything pasted here."
         )
-        return
 
     with st.container(border=True):
         st.markdown("**Copy the PrizePicks board and paste it here**")
