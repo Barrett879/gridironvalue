@@ -372,7 +372,7 @@ def render_board(scope_proj: pd.DataFrame, season: int, week: int,
     if foot:
         st.markdown(foot, unsafe_allow_html=True)
     st.markdown(
-        '<div class="gv-note">Model values are distribution means, not '
+        '<div class="gv-note">Model values are distribution MEDIANS, not '
         "forecasts. The gap is a difference, never a dollar value. Rows marked "
         "<b>baseline</b> come from a season average because the model for that "
         "stat lost to one out of sample.</div>",
@@ -492,6 +492,17 @@ def render_player_lines(lines_for_player: list) -> str:
 
 
 def _clear_lines(season: int, week: int) -> None:
+    """Delete every saved board. GUARDED, because it is destructive and public.
+
+    On the published site the saved boards are the COMMITTED ones, so an
+    unguarded button here let any anonymous visitor unlink the record everyone
+    else was reading. It came back on the next container restart, which is worse
+    than a clean failure: the site would be intermittently empty for reasons
+    nobody could reproduce. Pasting is allowed on the published board; deleting
+    what shipped with it is not.
+    """
+    if _read_only():
+        return
     for w in props.saved_weeks(season):
         props.lines_path(season, w).unlink(missing_ok=True)
 

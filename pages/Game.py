@@ -189,13 +189,16 @@ if inj.empty:
         f"{GAME['lock_at'].strftime('%-I:%M %p')} ET for this game."
     )
 
+# This used to say "per-player projections are not built yet", unconditionally,
+# and it kept saying it for months after they shipped: every visitor read it
+# directly BENEATH the projections it denied the existence of.
 notes.append(
-    "<b>Per-player projections are not built yet.</b> They arrive once the "
-    "models clear walk-forward validation, and each stat will ship only if it "
-    "beats a season-to-date average and a shrunk rate baseline out of sample. "
-    "The depth chart above is the opportunity picture those projections will "
-    "be built on. Every number this site eventually shows is the mean of a "
-    "modelled distribution, not a forecast of what will happen."
+    "<b>Model values are medians, not forecasts.</b> A projection of 68 "
+    "receiving yards means half of this player's outcomes in this spot land "
+    "above it and half below, which is the number a half-point line actually "
+    "asks about. Two stats are served from a season-to-date average instead of "
+    "the model, because the model loses to that average out of sample; they are "
+    "marked where they appear."
 )
 
 if str(GAME.get("roof_type")) == "retractable":

@@ -1152,3 +1152,22 @@ def test_an_edge_is_measured_against_the_common_side_not_a_coin():
     assert rec["baseline"] == 60.0
     assert rec["beats_coin"] is False, (
         "55% was called an edge while losing to always taking the common side")
+
+
+def test_readonly_blocks_the_destructive_clear(tmp_path, monkeypatch):
+    """Clear all deletes the COMMITTED boards on the published site. Unguarded,
+    any anonymous visitor could wipe the record everyone else was reading, and
+    it would come back on the next restart, which is worse than failing."""
+    import gridlib.cache as C
+    import props_ui
+    monkeypatch.setattr(props, "dc_path", lambda name: tmp_path / name)
+    monkeypatch.setattr(C, "READ_ONLY", False)
+    props.save_lines(2026, 7, pd.DataFrame([{"name": "x", "stat_type": "Pass Yards",
+                                             "line": 1.0}]))
+    assert props.load_lines(2026, 7) is not None
+    monkeypatch.setattr(C, "READ_ONLY", True)
+    props_ui._clear_lines(2026, 7)
+    assert props.load_lines(2026, 7) is not None, "read-only host allowed a delete"
+    monkeypatch.setattr(C, "READ_ONLY", False)
+    props_ui._clear_lines(2026, 7)
+    assert props.load_lines(2026, 7) is None, "local clear should still work"

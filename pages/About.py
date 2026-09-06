@@ -39,7 +39,7 @@ st.markdown(
 st.markdown("""
 <div class="gv-note" style="font-size:0.95rem;max-width:74ch;line-height:1.65">
 
-<b>Every number here is a mean, not a prediction.</b> A projection of 68
+<b>Every number here is a median, not a prediction.</b> A projection of 68
 receiving yards does not say a player will gain 68 yards. It says that across
 the distribution of ways the game could go, the average is about 68. Individual
 games scatter widely around that, and football scatters more than most sports.

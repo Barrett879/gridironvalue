@@ -3,7 +3,7 @@
 Per-game expected stat lines for every projected NFL skill player, with the
 market as context and an honest account of which numbers are worth reading.
 
-**Every number is the mean of a modelled distribution, not a forecast of what
+**Every number is the median of a modelled distribution, not a forecast of what
 will happen.** This is an informational analytics site. It is not a sportsbook,
 it accepts no wagers, and it offers no betting advice.
 
