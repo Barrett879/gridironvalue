@@ -1074,3 +1074,28 @@ def test_displayed_value_is_the_median_not_the_mean():
                            "line": 34.5, "odds_type": "standard", "direction": None}])
     table, _ = props.compare(lines, proj)
     assert abs(float(table.iloc[0]["model"]) - med) < 0.05
+
+
+# ── The gap column is only safe because MODEL is the median ─────────────────
+def test_gap_sign_always_agrees_with_the_lean():
+    """The gap was removed once for being the biased quantity, and is back only
+    because MODEL is now the median. As the mean it contradicted the lean on 84
+    of 701 rows. If MODEL ever reverts to the mean, this fails."""
+    from gridlib import uncertainty as U
+    if not U.available():
+        pytest.skip("calibration artifact not built")
+    proj = _proj()
+    proj["receiving_yards"] = 60.0
+    proj["position"] = "WR"
+    for line in (40.5, 55.5, 58.5, 62.5, 80.5):
+        lines = pd.DataFrame([{"name": "Patrick Mahomes",
+                               "stat_type": "Receiving Yards", "line": line,
+                               "odds_type": "standard", "direction": None}])
+        table, _ = props.compare(lines, proj)
+        if table.empty:
+            continue
+        r = table.iloc[0]
+        if r["kind"] != "mean":
+            continue
+        assert (r["diff"] > 0) == (r["lean"] == "More"), (
+            f"line {line}: gap {r['diff']:+.2f} disagrees with lean {r['lean']}")

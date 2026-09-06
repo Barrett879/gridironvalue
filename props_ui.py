@@ -405,13 +405,13 @@ def _ledger_html(table: pd.DataFrame) -> str:
             f'{_odds_badge(r.get("odds_type"))}{badge}</span>'
             f'{_fmt_model(r)}'
             f'<span class="num line">{r["line"]:.1f}</span>'
-            f'{_fmt_chance(r)}'
+            f'{_fmt_gap(r)}'
             f'<span class="lean {cls}">{esc(r["lean"])}</span>'
             f"</div>")
     head = ('<div class="gv-ledger-head">'
             '<span class="nm">Player</span><span class="st">Stat</span>'
             '<span class="num">Model</span><span class="num">Line</span>'
-            '<span class="num">Chance</span><span class="lean">Lean</span></div>')
+            '<span class="num">Gap</span><span class="lean">Lean</span></div>')
     return f'<div class="gv-ledger">{head}{"".join(rows)}</div>'
 
 
@@ -431,38 +431,39 @@ def _fmt_model(r) -> str:
     return f'<span class="num">{r["model"]:.1f}</span>'
 
 
-def _fmt_chance(r) -> str:
-    """Confidence in the lean actually shown, as a percentage.
+def _fmt_gap(r) -> str:
+    """How far the projection sits from the line, in the stat's own units.
 
-    The GAP is deliberately not the headline any more. It was the decision rule
-    until now and it was biased: these stats are right-skewed, so a line below
-    the projected mean can still sit above the median, and leaning on the gap
-    put the model on the More side of 66% of receiving-yards lines when only 41%
-    went Over. Reporting the probability of the leaned side puts the number a
-    reader acts on in front of them, and makes "+7.8 yards" visibly a coin flip
-    when that is what it is.
+    This was a percentage, and the percentage was the problem: 29% of the board
+    lands between 50 and 55, where "52%" dresses a coin flip in a precise
+    looking number. The gap says the same thing in units a reader already
+    understands ("0.2 receptions under the line") without implying precision
+    that is not there.
 
-    Rows with no fitted distribution (combination props, kickers, the fantasy
-    composite) still show the gap, which is visually distinct from a percentage.
+    THE GAP IS ONLY SAFE TO SHOW BECAUSE MODEL IS NOW THE MEDIAN. As the mean it
+    was the biased quantity that made receiving yards -5.4 and rushing -7.7,
+    and it contradicted the lean on 84 rows. Median minus line agrees with the
+    lean by construction, so the sign and the verdict can never disagree.
+
+    The probability still decides the lean and still ranks the board; it is just
+    no longer printed.
     """
-    cls = "over" if r.get("lean") == "More" else "under" if r.get("lean") == "Less" else ""
-    conf = None
+    cls = _lean_cls(r.get("lean"))
     if r.get("kind") == "probability":
-        conf = max(float(r["model"]), 1 - float(r["model"]))
-    elif r.get("p_over") is not None and pd.notna(r.get("p_over")):
-        conf = max(float(r["p_over"]), 1 - float(r["p_over"]))
-    if conf is not None:
-        from gridlib import uncertainty as _u
-        # Above the validated range, say so rather than printing a precise
-        # number nothing has checked.
-        txt = (f"{100 * _u.VALIDATED_MAX:.0f}%+" if conf > _u.VALIDATED_MAX
-               else f"{100 * conf:.0f}%")
-        return f'<span class="num diff {cls}">{txt}</span>'
-    # No fitted distribution for this stat, so there is no chance to report.
-    # Showing the gap here read as "CHANCE -0.4", which is not a chance at all.
-    # The tier badge already says the stat is unmeasured; the honest cell is
-    # empty rather than a number in the wrong units.
-    return f'<span class="num diff">{SENTINEL}</span>'
+        # A touchdown row's model value IS a probability, so its distance from
+        # the line is measured in percentage points away from a coin flip.
+        return (f'<span class="num diff {cls}">'
+                f'{100 * float(r["model"]) - 50:+.0f}pt</span>')
+    d = r.get("diff")
+    if d is None or pd.isna(d):
+        return f'<span class="num diff">{SENTINEL}</span>'
+    # Yards move in whole numbers; receptions and attempts do not.
+    dec = 0 if abs(float(d)) >= 10 else 1
+    v = round(float(d), dec)
+    if v == 0:
+        # Avoid "-0.0", which reads as a typo. A gap that rounds away is zero.
+        return f'<span class="num diff">0.0</span>'
+    return f'<span class="num diff {cls}">{v:+.{dec}f}</span>'
 
 
 def render_player_lines(lines_for_player: list) -> str:
@@ -481,12 +482,12 @@ def render_player_lines(lines_for_player: list) -> str:
             f'{_odds_badge(p.get("odds_type"))}{badge}</span>'
             f'{_fmt_model(p)}'
             f'<span class="num line">{p["line"]:.1f}</span>'
-            f'{_fmt_chance(p)}'
+            f'{_fmt_gap(p)}'
             f'<span class="lean {cls}">{esc(p["lean"])}</span>'
             f"</div>")
     head = ('<div class="gv-pl-head"><span class="st">Stat</span>'
             '<span class="num">Model</span><span class="num">Line</span>'
-            '<span class="num">Chance</span><span class="lean">Lean</span></div>')
+            '<span class="num">Gap</span><span class="lean">Lean</span></div>')
     return f'<div class="gv-pl">{head}{"".join(rows)}</div>'
 
 
