@@ -135,7 +135,11 @@ STAT_MAP: dict[str, tuple[tuple[str, ...], float]] = {
     # probability, not a rename.
     "player touchdowns": (("__prob__", "rushing_tds", "receiving_tds"), 1.0),
     "anytime td": (("__prob__", "rushing_tds", "receiving_tds"), 1.0),
-    "pass+rush+rec tds": (("__prob__", "rushing_tds", "receiving_tds"), 1.0),
+    # passing_tds belongs here and was missing, so a QB projected 1.9 passing
+    # and 0.22 rushing touchdowns was priced on lambda = 0.22 instead of 2.12,
+    # putting every quarterback row near 0% against a standard 1.5 line.
+    "pass+rush+rec tds": (("__prob__", "rushing_tds", "receiving_tds",
+                           "passing_tds"), 1.0),
     "rush tds": (("__prob__", "rushing_tds"), 1.0),
     "rec tds": (("__prob__", "receiving_tds"), 1.0),
     "receiving tds": (("__prob__", "receiving_tds"), 1.0),
@@ -147,7 +151,18 @@ STAT_MAP: dict[str, tuple[tuple[str, ...], float]] = {
     "rec+rush yards": (("receiving_yards", "rushing_yards"), 1.0),
     "fg made": (("fg_made",), 1.0),
     "field goals made": (("fg_made",), 1.0),
-    "kicking points": (("fg_made", "pat_att"), 1.0),  # approximated below
+    # 3 points a field goal, 1 an extra point. This was ("fg_made", "pat_att")
+    # with scale 1.0 and a comment saying "approximated below", but nothing
+    # below approximated anything: compare() sums the columns, so the model
+    # value was a COUNT OF KICKS shown against a POINTS line. On the 2026 week 1
+    # board that made all 31 kicking rows read 3.3 to 4.3 against lines of 7.5
+    # to 9.5, so every one of them leaned Less for a units error rather than a
+    # reason, and grade() scored the same wrong quantity as the "actual".
+    #
+    # `pat_made` is not modelled, so attempts stand in for made. Extra points
+    # convert about 94%, which overstates by ~0.15 points on a typical night;
+    # that is a rounding error next to being out by a factor of two.
+    "kicking points": (("__wsum__", "fg_made", 3.0, "pat_att", 1.0), 1.0),
 }
 
 # Props this model CANNOT price. Rejected by name, counted, and explained.
@@ -888,7 +903,15 @@ def compare(lines: pd.DataFrame, proj: pd.DataFrame,
         # reader is never shown a probability formatted as a stat line.
         kind, compare_to = "mean", line_val
 
-        if cols and cols[0] == "__prob__":
+        if cols and cols[0] == "__wsum__":
+            # (sentinel, col, weight, col, weight, ...)
+            pairs = list(zip(cols[1::2], cols[2::2]))
+            vals = [p.get(c_) for c_, _ in pairs]
+            if any(v is None or pd.isna(v) for v in vals):
+                continue
+            model_val = sum(float(v) * float(w) for v, (_, w) in zip(vals, pairs))
+            src = "model_low_confidence"
+        elif cols and cols[0] == "__prob__":
             parts = [p.get(c) for c in cols[1:]]
             lam = sum(float(v) for v in parts
                       if v is not None and pd.notna(v))
@@ -1039,6 +1062,23 @@ def grade(table: pd.DataFrame, actuals: pd.DataFrame) -> pd.DataFrame:
         cols, scale, refusal = _resolve_stat(r["stat"])
         if cols is None or cols == ("__fantasy__",):
             continue
+        if cols and cols[0] == "__wsum__":
+            pairs = list(zip(cols[1::2], cols[2::2]))
+            key = normalize_name(r["player"])
+            if key not in by_key.index:
+                continue
+            a_ = by_key.loc[key]
+            vals = [a_.get(ACTUAL_MAP.get(c_, c_)) for c_, _ in pairs]
+            if any(v is None or pd.isna(v) for v in vals):
+                continue
+            actual = sum(float(v) * float(w) for v, (_, w) in zip(vals, pairs))
+            result = ("More" if actual > r["line"]
+                      else "Less" if actual < r["line"] else "Exact")
+            rows.append({**r.to_dict(), "actual": round(actual, 2),
+                         "result": result,
+                         "model_correct": (None if result == "Exact"
+                                           else result == r["lean"])})
+            continue
         key = normalize_name(r["player"])
         if key not in by_key.index:
             continue
@@ -1110,6 +1150,23 @@ def season_record(graded_weeks: list[pd.DataFrame]) -> dict:
         return {"n": int(len(allg)), "decided": 0}
     hits = int(decided["model_correct"].sum())
     lo, hi = wilson_interval(hits, n)
+
+    # THE BAR IS NOT A COIN, and using one overstates the record badly.
+    #
+    # This compared the lower bound to 0.5 and called anything above it "an
+    # edge". But nobody picking props flips a coin: the do-nothing strategy is
+    # to take the side that comes in more often, and on this project's own
+    # out-of-sample measurement that side wins 56.4% to 60.4% of the time
+    # depending on the stat. A 55% record would have been announced as an edge
+    # while actually LOSING to doing nothing.
+    #
+    # So the bar is measured from the graded rows themselves: whichever side
+    # came in more often is what a lazy picker would have taken.
+    res = decided.get("result")
+    base = 0.5
+    if res is not None and len(res):
+        over = float((res == "More").mean())
+        base = max(over, 1.0 - over)
     return {
         "n": int(len(allg)),
         "decided": n,
@@ -1117,8 +1174,10 @@ def season_record(graded_weeks: list[pd.DataFrame]) -> dict:
         "hit_rate": round(100 * hits / n, 1),
         "ci_low": round(100 * lo, 1),
         "ci_high": round(100 * hi, 1),
-        # A coin is 50. An edge exists only if the LOWER bound clears it.
-        "beats_coin": bool(lo > 0.5),
+        # The rate a picker gets for free by always taking the more common side.
+        "baseline": round(100 * base, 1),
+        # An edge exists only if the LOWER bound clears that, not 50.
+        "beats_coin": bool(lo > base),
         "ties": int(allg["model_correct"].isna().sum()),
     }
 

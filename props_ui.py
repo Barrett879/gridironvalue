@@ -627,9 +627,10 @@ def render_week_record(season: int, weeks: list[int]) -> None:
         st.markdown(
             f'<div class="gv-note"><b>{rec["hits"]} of {rec["decided"]} '
             f'({rec["hit_rate"]}%)</b>, 95% confidence interval '
-            f'{rec["ci_low"]}% to {rec["ci_high"]}%. A coin is 50%, so this is '
-            f'<b>{verdict}</b>. Graded against the projection frozen when each '
-            f'line was first seen, never a recomputed one.'
+            f'{rec["ci_low"]}% to {rec["ci_high"]}%. Always taking the more '
+            f'common side would have won {rec.get("baseline", 50)}% for free, '
+            f'so this is <b>{verdict}</b>. Graded against the projection frozen '
+            f'when each line was first seen, never a recomputed one.'
             + (f' {rec["ties"]} line(s) landed exactly on the number and are '
                'counted as neither.' if rec.get("ties") else "")
             + '</div>', unsafe_allow_html=True)

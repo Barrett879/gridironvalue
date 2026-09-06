@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import props_ui  # noqa: E402
 from gridlib import fetch, predict, props, store  # noqa: E402
 from gridlib.teams import canonical, distinguish  # noqa: E402
+from gridlib.util import esc  # noqa: E402
 from gridlib.theme import (  # noqa: E402
     SITE_NAME,
     render_footer,
@@ -100,7 +101,8 @@ if season is None or week is None or not away or not home:
 GAME = fetch.find_game(season, week, away, home, SCHED)
 if GAME is None:
     _bail(
-        f"<b>No game found for {away} at {home} in week {week} of {season}.</b> "
+        f"<b>No game found for {esc(away)} at {esc(home)} in week "
+        f"{week} of {season}.</b> "
         "Either the teams did not play each other that week, or one of them was "
         "on bye. Every team has one bye, so a matchup that exists in one week "
         "will not exist in another.",

@@ -352,7 +352,7 @@ def _prior_roll_mean(df: pd.DataFrame, key: str, col: str, window: int) -> pd.Se
     filled = df[col].astype(float).fillna(0.0)
     return (
         filled.groupby(df[key], sort=False)
-        .apply(lambda s: s.shift(1).rolling(window, min_periods=1).mean())
+        .apply(lambda s: s.rolling(window, min_periods=1).mean())
         .reset_index(level=0, drop=True)
     )
 

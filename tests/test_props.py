@@ -1099,3 +1099,56 @@ def test_gap_sign_always_agrees_with_the_lean():
             continue
         assert (r["diff"] > 0) == (r["lean"] == "More"), (
             f"line {line}: gap {r['diff']:+.2f} disagrees with lean {r['lean']}")
+
+
+# ── Audit fixes: units, lambda completeness, and the real baseline ──────────
+def test_kicking_points_is_scored_in_POINTS_not_kicks():
+    """3 points a field goal, 1 an extra point. This was a plain sum of counts,
+    so all 31 kicking rows on the 2026 week 1 board read 3.3-4.3 against lines
+    of 7.5-9.5 and leaned Less for a units error rather than a reason."""
+    proj = _proj()
+    proj["fg_made"] = 2.0
+    proj["pat_att"] = 3.0
+    proj["position"] = "K"
+    lines = pd.DataFrame([{"name": "Patrick Mahomes", "stat_type": "Kicking Points",
+                           "line": 6.5, "odds_type": "standard", "direction": None}])
+    table, _ = props.compare(lines, proj)
+    assert len(table) == 1
+    # 3*2 + 1*3 = 9, not 2 + 3 = 5.
+    assert table.iloc[0]["model"] == pytest.approx(9.0, abs=0.01)
+    assert table.iloc[0]["lean"] == "More"
+
+
+def test_kicking_points_grades_in_the_same_units_it_prices():
+    """Grading a weighted stat with an unweighted actual would score a
+    different quantity than the one shown."""
+    table, _ = props.compare(
+        pd.DataFrame([{"name": "Patrick Mahomes", "stat_type": "Kicking Points",
+                       "line": 6.5, "odds_type": "standard", "direction": None}]),
+        _proj().assign(fg_made=2.0, pat_att=3.0, position="K"))
+    actuals = pd.DataFrame([{"player_display_name": "Patrick Mahomes",
+                             "fg_made": 3.0, "pat_att": 2.0}])
+    g = props.grade(table, actuals)
+    assert len(g) == 1
+    assert g.iloc[0]["actual"] == pytest.approx(11.0, abs=0.01)   # 3*3 + 2
+
+
+def test_combined_td_prop_includes_passing_touchdowns():
+    """'Pass+Rush+Rec TDs' omitted passing_tds, so a QB projected 1.9 passing
+    and 0.22 rushing touchdowns was priced on lambda 0.22 instead of 2.12 and
+    sat near 0% against a standard 1.5 line."""
+    cols, _scale, _refusal = props._resolve_stat("Pass+Rush+Rec TDs")
+    assert "passing_tds" in cols, "passing_tds missing from the lambda"
+
+
+def test_an_edge_is_measured_against_the_common_side_not_a_coin():
+    """Nobody flips a coin picking props. The do-nothing bar is taking the side
+    that comes in more often, which this project measured at 56-60%."""
+    g = pd.DataFrame([{"model_correct": True, "result": "Less"}] * 55
+                     + [{"model_correct": False, "result": "Less"}] * 5
+                     + [{"model_correct": False, "result": "More"}] * 40)
+    rec = props.season_record([g])
+    assert rec["hit_rate"] == 55.0
+    assert rec["baseline"] == 60.0
+    assert rec["beats_coin"] is False, (
+        "55% was called an edge while losing to always taking the common side")
