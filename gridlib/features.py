@@ -222,6 +222,20 @@ POSDEF_EXCLUDE_TARGETS = frozenset({
 # The strategy document's section 3 and the last rich unused source. Built as
 # STRICTLY PRIOR-SEASON, league-relative rates; see add_def_scheme for why
 # both of those are load-bearing rather than stylistic.
+# Role change: the chart says one thing, the player's own history says another.
+# Under test. Targets a MEASURED gap (second-year rushing volume, +4.5%), not a
+# plausible story.
+# REJECTED. +0.22% validation, +0.04% test, with replicated regressions on
+# carries and carries::rank1 - the exact target the hypothesis was about.
+#
+# The underlying gap is REAL: second-year rushing volume is under-projected by
+# 4.5%, and the narrow promoted-RB1 cohort by 17%. This feature does not close
+# it. Knowing a player is ranked above his own history apparently does not tell
+# the model how much MORE work he will get, and for backs it actively hurts.
+#
+# Kept wired and off because the leak lesson below is worth more than the block.
+USE_ROLE_CHANGE = False
+
 # Weather at kickoff, from Open-Meteo. Under test.
 #
 # Masked to OUTDOOR games: a dome has no weather, and feeding it 0mph would say
@@ -477,6 +491,63 @@ def _scheme_table() -> pd.DataFrame:
             )
         _SCHEME_CACHE["df"] = t
     return _SCHEME_CACHE["df"]
+
+
+def add_role_change(df: pd.DataFrame) -> pd.DataFrame:
+    """How far a player's CURRENT role diverges from his own usage history.
+
+    THE GAP THIS TARGETS, MEASURED NOT ASSUMED
+    -------------------------------------------
+    Second-year rushing volume is under-projected by 4.5% on both carries and
+    rushing yards, pooled over three walk-forward folds, and no other experience
+    bucket or target shows it (rookies -0.6%, veterans -3.2%). Narrowed to
+    second-year backs listed RB1 with light rookie usage, the miss is 1.12
+    carries a game, about 17%. The mechanism is a ROLE CHANGE the model cannot
+    see: it knows current depth rank and it knows prior usage, but not that the
+    two disagree.
+
+    THE FIRST VERSION OF THIS WAS A LEAK. READ THIS BEFORE CHANGING IT.
+    -------------------------------------------------------------------
+    It ranked each player against the others at his position on his team THAT
+    WEEK. In the backfill that group is "players who recorded a stat line", so
+    the group averages 1.22 quarterbacks and 2.82 backs; on a depth chart at
+    inference it is 2.92 and 4.57. The rank was therefore encoding WHO PLAYED,
+    which is postgame, and QB attempts improved 7.97% and 7.96% on the two folds
+    with no regressions anywhere. It replicated perfectly, because a leak is
+    present in every fold. Only the implausible size gave it away.
+
+    So the comparison is now against a LEAGUE NORM computed from strictly prior
+    seasons, and never against the current week's roster. No group membership
+    enters the feature, so there is nothing for the appeared-only table to leak.
+    """
+    out = df.copy()
+    need = {"season", "position", "depth_rank_capped"}
+    if not need.issubset(out.columns) or "f_career_off_snaps" not in out.columns:
+        return out
+
+    usage = pd.to_numeric(out["f_career_off_snaps"], errors="coerce")
+    rank = pd.to_numeric(out["depth_rank_capped"], errors="coerce")
+
+    # Typical prior usage for a player at this position AND this depth rank,
+    # from seasons strictly before this row's. Expanding over prior seasons
+    # only, exactly like the league priors elsewhere in this module.
+    key = out["position"].astype(str) + "|" + rank.fillna(-1).astype(int).astype(str)
+    tmp = pd.DataFrame({"key": key, "season": out["season"], "usage": usage})
+    per = (tmp.dropna(subset=["usage"])
+              .groupby(["key", "season"], as_index=False)["usage"].mean()
+              .sort_values("season"))
+    per["norm"] = (per.groupby("key")["usage"]
+                      .apply(lambda x: x.shift(1).expanding().mean())
+                      .reset_index(level=0, drop=True))
+    out = out.merge(per[["key", "season", "norm"]].assign(_k=per["key"]),
+                    left_on=[key.rename("_k"), "season"],
+                    right_on=["_k", "season"], how="left", suffixes=("", "_n"))
+
+    # Below 1 means the chart rates him above what his own history supports,
+    # which is the promotion case. Above 1 is a veteran in a crowded room.
+    out["f_usage_vs_rank"] = usage / out["norm"].replace(0, np.nan)
+    out["f_role_promoted"] = (out["f_usage_vs_rank"] < 0.6).astype(float)
+    return out.drop(columns=[c for c in ("key", "_k", "norm") if c in out.columns])
 
 
 def mask_indoor_weather(df: pd.DataFrame) -> pd.DataFrame:
@@ -806,6 +877,8 @@ def build(df: pd.DataFrame, league_by_season: pd.DataFrame,
     out = add_share_history(out)
     if USE_POSITIONAL_DEF:
         out = add_positional_defense(out)
+    if USE_ROLE_CHANGE:
+        out = add_role_change(out)
     if USE_WEATHER:
         out = mask_indoor_weather(out)
     if USE_SCHEME:

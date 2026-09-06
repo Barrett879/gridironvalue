@@ -67,6 +67,7 @@ BLOCKS = {
     "pfradv": "USE_PFR",
     # Round 4.
     "weather": "USE_WEATHER",
+    "rolechg": "USE_ROLE_CHANGE",
 }
 
 # Blocks that have already passed the gate. `--base` puts them in BOTH the
