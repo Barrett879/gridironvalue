@@ -313,3 +313,52 @@ def test_latest_depth_chart_is_unchanged_by_the_memo():
 
     bad = [k for k in fresh if not fresh[k].equals(memoed[k])]
     assert not bad, f"memoized slices differ for {bad}"
+
+
+def test_depth_chart_weeks_never_come_from_after_the_season():
+    """A snapshot taken after the last kickoff describes no week of this season.
+
+    It used to be CLIPPED onto the final week, which put post-season and
+    offseason information into `depth_rank`, `depth_rank_capped` and
+    `is_starter`, all classified PREGAME and all shipped features. The 2025 file
+    runs to 2026-03-14, after the Super Bowl and after the 2026 league year
+    opened, and 89.6% of the rows landing on week 18 were taken after week 18
+    had kicked off. `depth_chart_normalized` keeps the LATEST snapshot per
+    (team, week, player), so every week-18 rank came from March.
+    """
+    import pandas as pd
+
+    from gridlib import fetch
+
+    dc = fetch.load_depth_charts(2025)
+    if dc is None or dc.empty or "dt" not in dc.columns:
+        pytest.skip("2025 depth chart not cached, or not the dt schema")
+
+    sched = fetch.load_schedules()
+    reg = sched[(sched["season"] == 2025) & (sched["game_type"] == "REG")]
+    if reg.empty:
+        pytest.skip("no 2025 schedule")
+
+    ts = pd.to_datetime(dc["dt"], format="ISO8601", utc=True, errors="coerce")
+    kick = fetch.kickoff_series(reg).dt.tz_convert("UTC")
+    first_by_week = kick.groupby(reg["week"].to_numpy()).min()
+
+    dated = dc.assign(_ts=ts)
+    dated = dated[dated["week"].notna() & dated["_ts"].notna()]
+    late = 0
+    for week, group in dated.groupby("week"):
+        cutoff = first_by_week.get(int(week))
+        if cutoff is None:
+            continue
+        late += int((group["_ts"] > cutoff).sum())
+    assert late == 0, (
+        f"{late} depth-chart snapshots are assigned to a week that had already "
+        "kicked off when they were taken; a pregame feature is carrying "
+        "postgame information"
+    )
+
+    # ...and the season must not lose a week to the fix.
+    norm = fetch.depth_chart_normalized(2025)
+    assert set(range(1, 19)) <= set(norm["week"].astype(int)), (
+        "dropping post-season snapshots removed a week from the chart entirely"
+    )

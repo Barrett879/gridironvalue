@@ -32,18 +32,18 @@ of hit rate. Measured out of sample: models trained through 2022, scored on
 | QB pass attempts | +11.5 | the strongest thing this model does |
 | Passing yards | +8.4 | strong |
 | QB completions | +7.9 | strong |
-| WR/TE receptions | +5.2 | moderate |
-| Targets | +5.0 | moderate |
+| Targets | +6.0 | moderate |
+| WR/TE receptions | +5.3 | moderate |
 | RB rush attempts | +4.3 | moderate |
 | Receiving yards | +2.9 | slight |
-| Rushing yards | +2.6 | slight |
+| Rushing yards | +2.4 | slight |
 
 **These numbers replace an earlier table that had the sign wrong on two props.**
 It reported receiving yards at -5.7 and rushing yards at -9.4, described both as
 worse than a coin flip, and put targets and rush attempts at zero. Those were
 measured under the retired rule that leaned on the gap between the model and the
 line. The site leans on P(Over) now, which is what fixed the yards props: on the
-same rows, receiving yards go -4.8 to +2.9 and rushing yards -7.4 to +2.6. The
+same rows, receiving yards go -4.8 to +2.9 and rushing yards -7.4 to +2.4. The
 mechanism is that these stats are right-skewed, so the mean sits above the
 median, and a line below the projected mean can still be above the median. The
 gap rule then leaned More on an outcome that was under a coin flip.

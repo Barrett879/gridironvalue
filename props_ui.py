@@ -171,17 +171,21 @@ def line_counts_by_game(scope_proj: pd.DataFrame, season: int, week: int) -> dic
     if (lines is None or lines.empty or scope_proj is None or scope_proj.empty
             or "game_id" not in scope_proj.columns):
         return {}
-    reg = predict.load_registry()
-    out: dict[str, int] = {}
-    for gid, gp in scope_proj.groupby("game_id"):
-        table, _meta = props.compare(lines, gp, reg)
-        # Count only what the game page will actually SHOW. Counting matches
-        # instead would promise a card of lines and then deliver fewer, which is
-        # the kind of small inconsistency that makes a page feel broken.
-        pickable, _hidden = props.filter_pickable(table)
-        if len(pickable):
-            out[str(gid)] = int(len(pickable))
-    return out
+    # ONE comparison over the whole week, then grouped. This ran compare()
+    # once per game, sixteen times, each time against the full 1325-line board,
+    # to produce data the single whole-week table already carries. Measured
+    # identical on the committed 2026 week 1 board, game for game, and 1.9x
+    # faster.
+    #
+    # Count only what the game page will actually SHOW. Counting matches
+    # instead would promise a card of lines and then deliver fewer, which is
+    # the kind of small inconsistency that makes a page feel broken.
+    table, _meta = props.compare(lines, scope_proj, predict.load_registry())
+    pickable, _hidden = props.filter_pickable(table)
+    if pickable.empty or "game_id" not in pickable.columns:
+        return {}
+    return {str(gid): int(len(rows))
+            for gid, rows in pickable.groupby("game_id")}
 
 
 def props_by_name(scope_proj: pd.DataFrame, season: int, week: int) -> dict:

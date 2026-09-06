@@ -395,8 +395,19 @@ def _attach_week_from_timestamp(df: pd.DataFrame, season: int) -> pd.DataFrame:
 
     A snapshot taken at time T describes the roster going into the next game, so
     it belongs to the week whose first kickoff is the earliest one at or after
-    T. Snapshots taken after the season's last kickoff are pinned to the final
-    week rather than dropped.
+    T. A snapshot taken after the LAST regular-season kickoff describes no week
+    of this season and is dropped.
+
+    It used to be pinned to the final week instead, which put post-season and
+    offseason information into a pregame feature. The 2025 file runs to
+    2026-03-14, after the Super Bowl and after the 2026 league year opened, and
+    89.6% of the rows that landed on week 18 were taken after week 18 had
+    already kicked off. `depth_chart_normalized` keeps the LATEST snapshot per
+    (team, week, player), so every week-18 depth rank came from March. Of the
+    387 week-18 rows in the backfill, 146 of the 382 joinable ones had a rank
+    that differed from the last one published before kickoff, and `is_starter`
+    flipped on 36. Kirk Cousins is rank 1 in the pre-kickoff chart, and started
+    with 32 attempts, and rank 2 in the shipped one.
     """
     out = df.copy()
     ts = pd.to_datetime(out["dt"], format="ISO8601", utc=True, errors="coerce")
@@ -417,9 +428,12 @@ def _attach_week_from_timestamp(df: pd.DataFrame, season: int) -> pd.DataFrame:
     # searchsorted on week-start boundaries: index i means "before week i+1".
     bounds = week_start["kick"].to_numpy()
     idx = bounds.searchsorted(ts.to_numpy(), side="left")
-    idx = idx.clip(0, len(week_start) - 1)
-    out["week"] = week_start["week"].to_numpy()[idx]
-    out.loc[ts.isna(), "week"] = pd.NA
+    # searchsorted returns len(bounds) for a timestamp after every kickoff.
+    # That is the post-season and offseason, which belongs to no week here, so
+    # it is marked rather than clipped onto the last one.
+    after_season = idx >= len(week_start)
+    out["week"] = week_start["week"].to_numpy()[idx.clip(0, len(week_start) - 1)]
+    out.loc[ts.isna() | after_season, "week"] = pd.NA
     return out
 
 
