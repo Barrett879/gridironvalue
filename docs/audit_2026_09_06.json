@@ -1,0 +1,1262 @@
+[
+ {
+  "severity": "critical",
+  "category": "ci-correctness",
+  "title": "Weekly refresh never commits: `git add` aborts on the per-season files its own builders write",
+  "file": ".github/workflows/weekly.yml",
+  "line": 101,
+  "failure": "First real execution (the Tuesday after week 1). `build_team_week.py --seasons 2026-2026` writes BOTH `cache/team_week_2026_v1.parquet` (per-season, scripts/build_team_week.py:235) and `cache/team_week_2026_2026_v1.parquet` (combined, :242); `build_player_week.py` does the same (:552 and :563). `.gitignore` un-ignores only the `YYYY_YYYY` form (`!cache/player_week_20[2-9][0-9]_20[2-9][0-9]_v1.parquet`), so the single-season files stay ignored. The shell expands `cache/player_week_*_v1.parquet cache/team_week_*_v1.parquet` to literal paths INCLUDING the two ignored ones, and `git add` given an explicitly named ignored path exits 1. Steps run under `bash -e`, so the step dies before `git diff --cached`, `git commit` and `git push`. Net effect: the job fails every week from week 1 onward and the current-season table is NEVER pushed, so the deployed site keeps projecting mid-season as if the season had not started \u2014 precisely the silent degradation the workflow header says it exists to prevent. Note the failure only occurs when there IS something to commit: before week 1 the glob matches only the tracked 2016-2025 files, `git add` succeeds and the job reports \"no change this week\", so it looks healthy right up to the moment it matters.",
+  "fix": "Name the two files explicitly instead of globbing, e.g. `git add \"cache/player_week_${Y}_${Y}_v1.parquet\" \"cache/team_week_${Y}_${Y}_v1.parquet\"` using steps.season.outputs.year, or restrict the glob to the double-year form (`cache/player_week_*_*_v1.parquet`). Adding `-f` would be wrong: it would commit the ignored per-season files too."
+ },
+ {
+  "severity": "critical",
+  "category": "train-serve-skew",
+  "title": "routes_run_proxy is zero-filled when participation is unpublished, collapsing four trained features to 0 for every in-season projection",
+  "file": "/Users/barrettcollins/Desktop/Claude/NFL Predict/gridlib/features.py",
+  "line": 67,
+  "failure": "`routes_run_proxy` is in VOLUME_STATS (features.py:67), so `add_player_history` builds f_career_/f_r3_/f_r8_/f_std_routes_run_proxy from it, and all four are in the shipped registry's feature list. But the source is participation data, which the repo itself documents as unavailable in season (gridlib/fetch.py:209 \"Publishes only AFTER the postseason and does not update in season\"; scripts/build_player_week.py:22 \"TRAINING-ONLY\"). When it is missing, `_routes()` returns an empty frame (build_player_week.py:119-121), the left merge yields an all-NaN column, and `_prior_mean` / `_prior_roll_mean` zero-fill it (features.py:313, 352). So every game in the CURRENT season contributes routes=0 to the player's history. From roughly week 4 of a live season, f_r3/f_r8/f_std_routes_run_proxy read exactly 0.00 for the entire league, where in training a starting WR carries ~32. The frozen 2016-2025 backfill keeps its real values, so this is invisible to every test. Verified 2026-09-06: fetch.load_participation(2026) returns None. Reproducing it by nulling 2025's routes and rebuilding features + predicting with the shipped joblibs over 4,746 week-6+ rows: targets 3.102 -> 2.291 (-26.2%), receptions 2.101 -> 1.519 (-27.7%), carries 6.184 -> 4.880 (-21.1%), attempts 26.774 -> 23.720 (-11.4%), receiving_yards -14.6%. Every projection on the board is understated by a fifth to a quarter for most of the season, and the error grows week by week as the rolling windows fill with zeros.",
+  "fix": "routes_run_proxy is a count whose SOURCE is structurally absent, not a count that is genuinely zero, so `_prior_mean`'s zero-fill is the wrong discipline for it (it is the same distinction the module already draws for ngs_/pfr_ rates at features.py:397). Either route it through `_prior_mean_skipna` and add a skipna variant of `_prior_roll_mean`, or drop the four routes features from the shipped set and retrain, since `off_snaps` is the live exposure proxy and is unaffected (f_r3_off_snaps was identical in both runs). Whichever is chosen, add a serve-time assertion that no trained feature is >90% NaN-or-constant on the live rows, and extend the weekly workflow's sanity check (.github/workflows/weekly.yml) from \"columns present\" to \"columns populated at the rate the history has\"."
+ },
+ {
+  "severity": "critical",
+  "category": "memory-oom",
+  "title": "Cold project_week peaks at ~1.4 GB RSS, over the ~1 GB container limit",
+  "file": "gridlib/predict.py",
+  "line": 341,
+  "failure": "A visitor opens gridironvalue.streamlit.app for a week whose predictions_{season}_w{NN}_m1.parquet is absent (it is gitignored \u2014 `.gitignore` line `cache/predictions_*.parquet` \u2014 so a fresh Streamlit Cloud clone has NONE). app.py:185 calls project_week_cached, which falls through to project_week and runs F.build over the 63,042-row x 177-column backfill concatenated with the constructed inference rows. Measured on this machine with the real serving import chain (streamlit + sklearn + plotly + polars + pyarrow loaded first, which alone is 228 MB RSS): project_week ran 22.2 s and hit a peak RSS of 1434 MB, ending resident at 1026 MB. On a ~1 GB container the process is OOM-killed and the page never renders. Even the sub-step is over budget: F.build alone on the backfill peaks at 1044 MB from a 307 MB baseline. Memory is also not returned \u2014 after `del out; gc.collect()` RSS stayed at 585-711 MB across repeated runs, so a container that survives one build carries ~350-475 MB of retained arena into the next request.",
+  "fix": "Two things have to change together. (a) Stop building features over ten years of history inside a web request: precompute and commit the per-week feature rows (or the projections themselves) the way player_week_20NN_20NN_v1.parquet is already committed by .github/workflows/weekly.yml, and have project_week_cached read them. (b) If the in-request build must stay, cut the working set: `del hist` after the concat on line 339, restrict `combined` to the feature columns the registry actually needs plus the group keys, and downcast the 126 float64 columns to float32 (halves the frame)."
+ },
+ {
+  "severity": "critical",
+  "category": "repeated-full-frame-load",
+  "title": "latest_depth_chart reloads and deep-copies the whole 499k-row depth-chart file on each of its 32 calls per week",
+  "file": "gridlib/predict.py",
+  "line": 163,
+  "failure": "build_inference_rows loops over the 16 games of a week and, for each of the two teams, calls fetch.latest_depth_chart. That is 32 calls. Every call goes to fetch.py:649 `dc = load_depth_charts(season)`, which is not memoized: it re-reads depth_charts_2026.parquet from disk (498,892 rows x 13 cols, 292 MB deep in memory) and then runs _attach_week_from_timestamp, which does a full `out = df.copy()` (fetch.py:366) of that same 292 MB frame plus a fresh `load_schedules()` (fetch.py:369). All of that work is thrown away to keep 21 rows. Measured: build_inference_rows takes 17.3 s and drives RSS from 147 MB to 476 MB (peak 557 MB) to produce a 609-row frame. Per-call cost measured at 0.47-0.57 s with RSS climbing ~100 MB per call and never coming back (140 -> 331 -> 433 -> 464 MB across three calls with gc.collect() between each). This is roughly 15 of the 22 seconds and several hundred MB of the OOM in the finding above.",
+  "fix": "Load the season's chart once per week build: hoist `load_depth_charts(season)` out of the loop and pass the frame down, or put `@lru_cache(maxsize=2)` on `load_depth_charts` (and on `load_schedules`). Filter to `week == week` and `pos_abb.isin(SKILL_POSITIONS)` once, then group by team. Also drop the `out = df.copy()` at fetch.py:366 \u2014 the function only assigns a new `week` column."
+ },
+ {
+  "severity": "critical",
+  "category": "correctness",
+  "title": "\"Kicking Points\" is priced and graded in the wrong units (FG count + XP attempts, not points)",
+  "file": "gridlib/props.py",
+  "line": 150,
+  "failure": "STAT_MAP[\"kicking points\"] = ((\"fg_made\", \"pat_att\"), 1.0) with the comment \"# approximated below\", but nothing below approximates anything: compare() at line 910 does model_val = sum(vals) * scale, so the model value is FG_made + PAT_att (a count, ~3-5) against a line posted in POINTS (7.5-9.5). Every one of the 31 Kicking Points lines on the committed board is frozen leaning Less with a manufactured -4 to -5.6 gap. Worse, grade() re-resolves the same columns at line 1046, so \"actual\" is computed in the same wrong units. Verified: a kicker who makes 3 FG + 3 XP = 12 real kicking points against an 8.5 line (a clear More) is graded actual=6.0, result=\"Less\", model_correct=True. The record books a loss as a win, 31 times on week 1 alone, and week_scorecard's mae/line_mae are polluted with it.",
+  "fix": "Either map it as ((\"fg_made\",\"pat_att\"), ...) with per-column weights (3 for fg_made, 1 for pat_made) rather than a single scalar `scale`, or move \"kicking points\" into REFUSE until a weighted mapping exists. A single float scale cannot express 3*FG + 1*XP."
+ },
+ {
+  "severity": "critical",
+  "category": "wrong-formula",
+  "title": "Kicking Points scores a field goal as 1 point instead of 3, and grade() re-uses the same wrong formula as the \"actual\"",
+  "file": "gridlib/props.py",
+  "line": 150,
+  "failure": "PrizePicks Kicking Points = 3 x FG made + 1 x XP. STAT_MAP maps it to (\"fg_made\", \"pat_att\") with scale 1.0, and compare() at props.py:911 does model_val = sum(vals) * scale, i.e. fg_made + pat_att. On the committed frozen week-1 board all 31 Kicking Points rows lean \"Less\": mean served model 3.99 against lines of 5.5-9.5, while the correctly scored projection averages 7.40. Re-scoring the 30 rows that also have an FG Made row (3*fg + pat) puts 17 of 30 on the WRONG SIDE (e.g. Harrison Butker: served 4.21 vs line 7.5 -> Less; true 3(1.97)+2.24 = 8.15 -> More). The same formula is then used for grading: ACTUAL_MAP (props.py:1002) carries fg_made and pat_att, so grade() computes actual = fg_made + pat_att. A kicker who makes 2 FG and 3 XP scores 9 real kicking points and beats a 7.5 line, but grade() returns actual=5.0, result=\"Less\", and marks the model's always-\"Less\" lean model_correct=True. Every kicker line is a manufactured hit in the frozen season record.",
+  "fix": "Score it as 3*fg_made + pat_att (or a pat_made projection) both in compare() and in grade(). A tuple-of-columns sum cannot express a weighted sum, so kicking points needs its own branch like the \"__prob__\" one, or a per-column weight in STAT_MAP."
+ },
+ {
+  "severity": "critical",
+  "category": "wrong-formula",
+  "title": "\"Pass+Rush+Rec TDs\" builds the Poisson lambda without passing_tds, so every QB row is priced at near 0%",
+  "file": "gridlib/props.py",
+  "line": 138,
+  "failure": "The stat is mapped to (\"__prob__\", \"rushing_tds\", \"receiving_tds\"), which omits passing_tds. compare() (props.py:889-897) sums only cols[1:] into lam, so a QB projected 1.9 passing TDs and 0.22 rushing TDs gets lam = 0.22 instead of 2.12. Against the standard 1.5 line, threshold_for_line -> 2 and poisson_at_least(0.22, 2) = 0.02, so the row reads 2% and leans \"Less\"; with the correct lam the module's own poisson_at_least(2.12, 2) = 0.63, i.e. \"More\". Worse, rank_by_reliability (props.py:551-556) ranks probability rows by |model - 0.5|, so these maximally-wrong rows sort to the TOP of the board. On the committed frozen week-1 board all 9 Pass+Rush+Rec TDs rows lean \"Less\" with models between 0.00 and 0.14 (Jordan Love 0.00, Josh Allen 0.14) - a stat where the market's 1.5 line implies roughly a coin flip.",
+  "fix": "Add passing_tds to the tuple for \"pass+rush+rec tds\" (and to the reliability lookup at props.py:925). Keep \"player touchdowns\"/\"anytime td\" as rush+rec only."
+ },
+ {
+  "severity": "critical",
+  "category": "correctness",
+  "title": "\"Kicking points\" is priced as fg_made + pat_att with no scoring weights; every one of the 31 live rows leans the wrong way",
+  "file": "gridlib/props.py",
+  "line": 150,
+  "failure": "A kicker with a posted \"Kicking Points\" line is scored as fg_made + pat_att (1 point per field goal) instead of 3*fg_made + pat_made. On the saved 2026 week 1 board all 31 kicking-points rows render a model value of 3.28 to 5.02 against lines of 5.5 to 9.5 and therefore ALL lean Less. Applying the real scoring gives 6.20 to 8.88 and flips 18 of the 31 leans to More. The trailing comment promises an approximation that does not exist anywhere in the file.",
+  "fix": "Map kicking points to a weighted composite (3 x fg_made + pat_made) rather than an unweighted sum, or add it to REFUSE until a weighted path exists. `pat_made` is already in columns.TARGETS but is not a trained target, so either train it or use pat_att as the PAT proxy with the 3x weight on fg_made applied explicitly."
+ },
+ {
+  "severity": "critical",
+  "category": "untested-behaviour",
+  "title": "grade() silently drops every touchdown and Fantasy Score prop; 44% of the real frozen record is ungradeable and nothing tests it",
+  "file": "gridlib/props.py",
+  "line": 1046,
+  "failure": "compare() prices touchdown props through the sentinel tuple (\"__prob__\", \"rushing_tds\", \"receiving_tds\") (props.py:136-141) and fantasy props through (\"__fantasy__\",). grade() resolves the same tuple and then does `vals = [a.get(ACTUAL_MAP.get(c, c)) for c in cols]`. ACTUAL_MAP has no \"__prob__\" key, so a.get(\"__prob__\") is None, the next line hits `if any(v is None ...): continue  # did not play, or not scored`, and the row is dropped with no counter. Fantasy rows are dropped one line earlier at props.py:1040. Graded on the committed cache/pp_frozen_2026_w01_v1.json with actuals fabricated for every player (so nothing can be dropped for a genuine DNP): 1022 frozen rows in, 571 graded out, 451 lost - 287 Player Touchdowns, 13 Rec TDs, 12 Rush TDs, 9 Pass+Rush+Rec TDs, 130 Fantasy Score. week_scorecard then reports n=571 as if that were the board. The accuracy record therefore excludes the single largest prop category on the board and says nothing about it. No test in tests/test_props.py grades a kind==\"probability\" or composite row: test_grade_scores_the_models_lean (line 277) and test_a_frozen_table_can_be_graded (line 730) both use Pass Yards only, and the whole TD block (test_td_prop_uses_probability_not_the_mean, line 812) stops at compare().",
+  "fix": "In grade(), handle the two sentinels explicitly: for (\"__prob__\", *stats) sum the actual TD columns and compare the count to the line; for (\"__fantasy__\",) recompose the PP score from actuals. Count anything still unresolvable into a meta bucket so the page can say \"451 lines not gradeable\". Add tests that grade one probability row (lean More, 1 TD scored -> hit) and one fantasy row."
+ },
+ {
+  "severity": "critical",
+  "category": "units-mislabelling",
+  "title": "\"Kicking Points\" model value is a count of kicks compared to a points line, and grading scores it the same wrong way, so every such row is a guaranteed hit in the public accuracy record",
+  "file": "gridlib/props.py",
+  "line": 150,
+  "failure": "STAT_MAP maps \"kicking points\" to (\"fg_made\",\"pat_att\") with scale 1.0, and compare() at gridlib/props.py:911 computes model_val = fg_made + pat_att. Kicking points are 3*FG + 1*PAT, so the Model column prints a KICK COUNT next to a POINTS line. On the committed 2026 week-1 board all 31 Kicking Points rows lean Less, 22 of them survive filter_pickable and render in the ledger, e.g. Brandon Aubrey \"Model 4.3 / Line 8.5 / Gap -4.2 / Less\" when 3*1.74+2.5 = 7.7 sits essentially on the line. grade() (gridlib/props.py:1046) then builds `actual` from the same two columns, so actual is also a kick count. Real 2025 week 5 kickers graded this way: Ka'imi Fairbairn scored 3 FG + 5 PAT = 14 kicking points (clearly OVER an 8.5 line) but is recorded as actual 8, result Less, model_correct True. All 8 kickers tested graded 8/8 = 100% hits. Those rows feed props.season_record() and therefore the headline \"Season record, out of sample: N of M (X%)\" plus its Wilson interval that app.py renders under the week board. 22 guaranteed hits out of 529 pickable rows moves a true 50% board to 52.1%, on a page whose whole verdict is whether the lower bound clears 50. week_scorecard's \"Model MAE\" vs \"Line MAE\" columns are corrupted the same way (model 4.2 vs actual 4.0 gives mae 1.48 against line_mae 4.62).",
+  "fix": "Either give the entry a real points composition (a scale cannot express 3*fg_made + 1*pat_att, so it needs its own branch in compare() and a matching branch in grade()'s ACTUAL_MAP path), or move \"kicking points\" into REFUSE until it can be priced. Do not leave the current mapping shipping to the ledger and the record."
+ },
+ {
+  "severity": "critical",
+  "category": "fabricated-edge-and-record-inflation",
+  "title": "Kicking Points is priced and graded as a raw count sum, not points: a 2x-too-small projection that leans Less on every kicker and then grades itself correct ~95% of the time",
+  "file": "gridlib/props.py",
+  "line": 150,
+  "failure": "PrizePicks \"Kicking Points\" = 3 x FG made + 1 x XP made. STAT_MAP maps it to (\"fg_made\", \"pat_att\") with scale 1.0, and compare() at props.py:910 does `sum(vals) * scale`, so the displayed model value is a raw count sum, roughly 1/1.9 of the real quantity. On the COMMITTED 2026 week-1 board (cache/pp_frozen_2026_w01_v1.json, 31 Kicking Points rows) mean model = 3.99 against mean line = 7.40, and ALL 31 rows lean Less; 22 are pickable and 21 survive filter_informed, so 21 rows render on the live ledger as e.g. \"Brandon Aubrey / Kicking Points / Model 4.26 / Line 8.5 / Gap -4.2 / Lean Less\". The same units error is repeated on the grading side: grade() at props.py:1046-1049 builds `actual` with the identical `sum(...) * scale`, so it scores the pick against fg_made+pat_att instead of 3*fg_made+pat_made. Measured on 2023-2025 kicker games (n=1629): fg_made+pat_att exceeds a 7.5 line 1.9% of the time, while true kicking points exceeds it 46.7%. So the projection error and the grading error point the same way and cancel. Over the 21 shown week-1 lines (3 at 5.5, 7 at 6.5, 8 at 7.5, 4 at 8.5) the site will bank ~20.8 of 22 (94.5%) as HITS into the frozen out-of-sample season record, while the actual bets would win ~10.9 of 22 (49.5%). These are exactly the rows that then feed the \"an edge, on this evidence\" verdict. The bug also corrupts the week table's Model MAE / Line MAE pair: model error ~0.9 against line error ~3.6 per kicking row, flattering the model by ~2.7 per row for free.",
+  "fix": "Either weight the components (3*fg_made + pat_made, using made rather than attempted PATs) in both compare() and grade(), or move \"kicking points\" into REFUSE until it can be priced, the way longest-X props are. Do not leave a stat where the projection and the grader share the same units error."
+ },
+ {
+  "severity": "critical",
+  "category": "html-injection",
+  "title": "Reflected HTML injection: ?away= / ?home= go raw into an unsafe_allow_html block (working open redirect)",
+  "file": "pages/Game.py",
+  "line": 103,
+  "failure": "`away = canonical(st.query_params.get(\"away\"))` (Game.py:88) returns any attacker string, only `.strip().upper()`-ed, and is interpolated into the `_bail()` f-string at line 103, which `store.render_notice()` hands to `st.markdown(..., unsafe_allow_html=True)` at Game.py:60. Any URL whose teams do not resolve reaches this path. Verified live against the app on 127.0.0.1:8571: `/Game?season=2026&week=1&away=<META HTTP-EQUIV=\"REFRESH\" CONTENT=\"0;URL=/About\">&home=SEA` navigated the browser off the page; with `CONTENT=\"99;URL=HTTPS://EXAMPLE.COM/\"` the tag landed verbatim in document.head. Since URL scheme and host are case-insensitive, `CONTENT=\"0;URL=HTTPS://EVIL.COM/\"` is a working open redirect from gridironvalue.streamlit.app to any site - a ready-made phishing link. Also verified rendering into the page body: `<IFRAME ID=GVIF SRC=\"/About\">` -> `<iframe id=\"GVIF\" src=\"/ABOUT\"></iframe>`, `<FORM ID=GVFORM ACTION=\"HTTPS://EXAMPLE.COM/STEAL\"><INPUT NAME=PW></FORM>` -> rendered form with input, `<H1>INJECTED</H1>` -> real h1 in the DOM. Inline handlers are the one thing that does not fire (React drops unknown `on*` props, and Streamlit's urlTransform blocks `javascript:`), so this is arbitrary-markup injection and forced navigation rather than script execution. `home` at the same line is identically injectable.",
+  "fix": "Wrap both values: `f\"...for {esc(away)} at {esc(home)} in week {week}...\"`, importing `esc` from gridlib.util in pages/Game.py."
+ },
+ {
+  "severity": "critical",
+  "category": "unsupported-edge-claim",
+  "title": "The season record calls anything above 50% \"an edge, on this evidence\", when the site's own out-of-sample measurement puts the do-nothing bar at 57-60%",
+  "file": "props_ui.py",
+  "line": 622,
+  "failure": "season_record() sets beats_coin from `lo > 0.5` (props.py:1121) and props_ui prints \"A coin is 50%, so this is an edge, on this evidence.\" But the null for prop side-picking is not a coin: the site's own validation (docs/lean_probability.csv, produced by scripts/validate_lean_probability.py) measures \"always take the more common side\" at 56.9% to 60.4% on every prop it grades, and data/stat_reliability.csv line 2 states the bar in words (\"picks the right side 67.9% against a 57.0% coin bar\"). Concrete failure: 250 graded out-of-sample lines, 145 hits = 58.0%, Wilson 95% CI [51.8, 64.0]. Lower bound clears 50, so the page renders \"145 of 250 (58.0%), 95% confidence interval 51.8% to 64.0%. A coin is 50%, so this is an edge, on this evidence.\" That 58% is inside the range the trivial always-more-common-side rule already achieves, and is BELOW it for receiving yards (59.7%) and rushing yards (60.4%). The site declares an edge on evidence that shows none, on the one page next to real betting decisions, and does so while the footer (gridlib/theme.py:852) claims it \"offers no betting advice\".",
+  "fix": "Compare the record against the same benchmark the validation uses (the realised more-common-side rate on the graded rows), not 50%, and only call it an edge when the interval clears that. Failing that, drop the word \"edge\" and report the rate and interval alone."
+ },
+ {
+  "severity": "critical",
+  "category": "join-key",
+  "title": "Depth-chart join uses raw team codes, so OAK/SD never match LV/LAC: 977 player-games lose depth_rank and are labelled non-starters",
+  "file": "scripts/build_player_week.py",
+  "line": 266,
+  "failure": "gridlib/teams.canonical() (OAK->LV, SD->LAC) exists and is unit-tested, but neither depth_chart_normalized() nor this merge calls it. depth_charts_2016.parquet spells the Raiders OAK and the Chargers SD; stats_player_week_2016.parquet spells them LV and LAC. The left merge on [season, week, team, gsis_id] therefore matches nothing for those franchises. Verified: 977 player-week rows (2016 LAC + 2016-2019 LV) have depth_rank null at a rate of exactly 1.000 while every other team runs 0.90-0.98. depth_rank_capped becomes NaN and is_starter, computed as (depth_rank_capped == 1).astype(float), becomes 0.0 because NaN == 1 is False. 79 of those rows are QB games with 20+ pass attempts -- Philip Rivers 2016 wk1 (36 att) and Derek Carr 2016 wk1 (38 att) both train as is_starter = 0.0. depth_rank_capped and is_starter are both in models/registry_m1.json feature_columns, so the models learn from starters mislabelled as backups.",
+  "fix": "Fold both sides through gridlib.teams.canonical: in depth_chart_normalized (gridlib/fetch.py ~line 739) add out[\"team\"] = out[\"team\"].map(canonical), and canonicalise df[\"team\"] before the merge in build_player_week. Then add a hard check in validate_backfill.py that no team-season has 0% depth_rank coverage."
+ },
+ {
+  "severity": "critical",
+  "category": "join-key",
+  "title": "is_home derived by comparing the box-score team code to the schedule's home_team, so 477 HOME player-games get the away side's market and rest features",
+  "file": "scripts/build_player_week.py",
+  "line": 420,
+  "failure": "games.parquet spells the Raiders OAK (2016-2019) and the Chargers SD (2016), while stats_player_week spells them LV and LAC. `is_home = df[\"team\"] == df[\"home_team\"]` is therefore False for every Raiders/Chargers row in those seasons, including their home games. For 477 player-games that ARE home games: team_implied_total and opp_implied_total are swapped, team_spread carries the OPPOSITE SIGN, and rest_days/opp_rest_days are swapped. All four are in models/registry_m1.json feature_columns. Worse, the same row carries is_home = 1 from the team_week merge (which is derived from pbp and is correct), so the row is internally contradictory: the model sees a home game whose spread says the team is a 3-point underdog when the market had it a 3-point favourite. Signed error on team_spread across those rows ranges from -28 to +28.",
+  "fix": "Do not recompute the home flag from a string compare. The correct flag already arrived from team_week two merges earlier (build_player_week.py:402). Use `is_home = df[\"is_home\"] == 1`, or canonicalise both sides via gridlib.teams.canonical before comparing. Add a hard check to validate_backfill.py asserting (pw.team == pw.home_team) equals pw.is_home for every row."
+ },
+ {
+  "severity": "critical",
+  "category": "tautology",
+  "title": "The point-in-time leakage tests exercise a helper defined in the test file, not the feature builder; a real rolling-window leak passes all 259 tests",
+  "file": "tests/test_leakage.py",
+  "line": 122,
+  "failure": "_prior_games() is defined at tests/test_leakage.py:122 and, by grep across gridlib/, scripts/, app.py, props_ui.py and pages/, is referenced only by three tests in the same file (lines 137, 144, 154). The production point-in-time builders are gridlib/features.py _prior_mean (297), _prior_mean_skipna (319), _prior_sum_and_n (339) and _prior_roll_mean (346). The three tests named as \"the canonical leak\" (test_history_excludes_the_target_game:133, test_history_is_strictly_before_not_up_to:141, test_a_players_first_ever_game_has_empty_history:151) assert that a filter written three lines above them filters, so they hold by construction and cannot fail for any change to features.py. Concretely: deleting `.shift(1)` from _prior_roll_mean makes every f_r3_*/f_r6_* rolling feature include the current game's own outcome - the exact leak the suite exists to catch, on the largest single block of features - and the suite stays fully green.",
+  "fix": "Replace the three _prior_games tests with tests that call features.add_player_history on a small synthetic frame and assert f_r3_<col> for row i equals the mean of rows i-3..i-1 only, and that a player's debut row is NaN. Keep _prior_games only if it is used as an independent oracle against the production output."
+ },
+ {
+  "severity": "high",
+  "category": "train-serve-skew",
+  "title": "f_team_proe_centered is NaN for 100% of live rows because the league table is pinned to league_season_2016_2025_v1.parquet",
+  "file": "/Users/barrettcollins/Desktop/Claude/NFL Predict/gridlib/features.py",
+  "line": 821,
+  "failure": "`add_team_history` centres PROE with `prior_lg = lg.shift(1)` then `tg[\"season\"].map(prior_lg)`. `lg` comes from gridlib/predict.py:74, hardcoded to `league_season_2016_2025_v1.parquet`, whose index is 2016..2025. A live 2026 row maps to a season absent from the index, so `map` returns NaN and `f_team_proe_centered` is NaN for every projected row, for every week of the season. It is column 108 of the 124 the models were trained on. Nothing catches it: `project_week`'s completeness check (predict.py:350) tests column PRESENCE only, and the column exists. The weekly workflow cannot fix it either \u2014 it runs build_team_week.py with `--seasons 2026-2026`, which writes `league_season_2026_2026_v1.parquet` under a different name and does not even commit it (the git add pattern is only player_week_*/team_week_*). In training, only 2016 rows had NaN here (9.6%), so the model's NaN branch for this feature was fitted on 2016 alone, and every 2026 projection is now routed down it. Measured on 2025 rows with the shipped artifacts, blanking the column moves individual projections by up to 3.23 attempts, 12.85 passing yards, 2.21 carries and 6.40 receiving yards.",
+  "fix": "Make the league table cover the serving season: either version the filename by content and have the weekly job rebuild + commit it (build_team_week.py:247 derives the name from --seasons, so `--seasons 2016-<current>` writes a new name predict.py must then read), or compute the prior-season league PROE from the team-week rows already inside `combined` rather than from a frozen side file. Additionally, strengthen the check at predict.py:350 from \"column exists\" to \"column is not entirely NaN on the live rows when it was mostly populated in training\" \u2014 that single assertion would have caught this and the routes bug above."
+ },
+ {
+  "severity": "high",
+  "category": "leakage",
+  "title": "2025+ depth charts pin every post-season and offseason snapshot to week 18, so depth_rank/is_starter for week 18 come from a March snapshot",
+  "file": "/Users/barrettcollins/Desktop/Claude/NFL Predict/gridlib/fetch.py",
+  "line": 385,
+  "failure": "`_attach_week_from_timestamp` clips any snapshot taken at or after week 18's first kickoff to week 18 (`idx.clip(0, len(week_start)-1)`), and `depth_chart_normalized` then keeps the LATEST snapshot per (team, week, gsis_id) via `drop_duplicates(..., keep=\"last\")` at fetch.py:752. For the 2025 file that latest snapshot is dated 2026-03-14 \u2014 after the Super Bowl and after the 2026 league year opened. So `depth_rank`, `depth_rank_capped` and `is_starter`, all classified PREGAME in gridlib/columns.py:106 and all shipped features (USE_DEPTH_RANK = True), carry post-season information for every week-18 row of the 2025 season. Verified: of the 387 week-18 2025 rows in the backfill, 146 of the 382 joinable ones (38.2%) have a depth rank that differs from the last rank published before week 18's kickoff; depth_rank_capped differs on 76 rows and is_starter flips on 36. Kirk Cousins is rank 1 in the pre-kickoff chart (he started, 32 attempts) and rank 2 in the shipped one. The same clipping corrupts scripts/build_availability.py, which fits the served p_play grid on the 2025 charts: week 18 normalizes to 887 (team, player) pairs against ~655 for weeks 16-17, and 212 of those 887 (23.9%) are players who appear on NO snapshot before week 18 kicked off \u2014 2026 offseason additions. All 212 are scored `appeared = False`, dragging week 18's observed appearance rate to 0.484 against 0.581 in week 17 and biasing every shrunk p_play cell low. 2025 is also the untouched holdout used to confirm the DVP block and refute the bio exclusion, and the same corruption will recur for 2026 and every season after, since 2025+ is the schema the site serves.",
+  "fix": "Do not clip past the last week. Assign a snapshot to the week whose first kickoff is the earliest one at or after it and DROP snapshots later than the final regular-season kickoff (or, better, key every snapshot to the specific game it precedes). The same guard is needed at the front: week 1 normalizes to 978 rows because every August training-camp snapshot piles onto it, while `latest_depth_chart` serves only the single final snapshot \u2014 so the availability grid is fit on a wider population than it is applied to. Add a test asserting that for every (season, week) the snapshot backing the shipped rank has dt < that week's first kickoff."
+ },
+ {
+  "severity": "high",
+  "category": "doc-drift",
+  "title": "README trust table publishes the retired gap-rule edges, inverting the sign on two props the site now rates positively",
+  "file": "README.md",
+  "line": 26,
+  "failure": "A reader opens the README to decide which props to trust. It says \"Receiving yards -5.7 worse than a coin flip\" and \"Rushing yards -9.4 worse than a coin flip\", and \"Targets, RB rush attempts ~0 no measurable edge\". The shipped board no longer picks sides by the gap: gridlib/props.py:951-958 sets the lean from P(Over). Measured under that rule (docs/lean_probability.csv, shipped in data/stat_reliability.csv) receiving yards is +2.6, rushing yards +1.8, targets +5.1, carries +4.2. Every number in the table is also stale: it is byte-for-byte the initial-commit run (git show b4e090b:docs/lean_accuracy.csv), not docs/lean_accuracy.csv as it stands.",
+  "fix": "Regenerate the table from data/stat_reliability.csv (the file the UI reads) and say the edges are measured under the P(Over) lean rule, not the model-minus-line gap."
+ },
+ {
+  "severity": "high",
+  "category": "silent-degradation",
+  "title": "`f_team_proe_centered` is NaN for every row of the season the site serves, because the committed league table stops at 2025",
+  "file": "gridlib/features.py",
+  "line": 819,
+  "failure": "`predict.project_week` loads `LEAGUE = \"league_season_2016_2025_v1.parquet\"` (gridlib/predict.py:71, read at :308) and hands it to `F.build`. `add_team_history` centres PROE on the PRIOR season's league mean via `league_by_season.set_index(\"season\")[\"league_off_proe\"].shift(1)` and then `tg[\"season\"].map(prior_lg)`. The shifted Series is indexed 2016..2025, so a 2026 inference row maps to NaN. `f_team_proe_centered` is one of the 124 columns in `models/registry_m1.json[\"feature_columns\"]`, so every 2026 projection the live site serves feeds the trees a NaN for that feature and they take a learned default branch. Nothing errors: `project_week`'s guard at gridlib/predict.py:346-352 only raises on a column that is MISSING, never on one that is present and entirely null. The weekly workflow rebuilds player_week and team_week but never refreshes league_season (build_team_week.py:247 writes `league_season_2026_2026_v1.parquet`, which is gitignored and which predict.py never reads), so this does not self-heal at any point in the season.",
+  "fix": "Either extend the league artifact to carry a row for the served season (rebuild + commit `league_season_*` weekly alongside player_week/team_week, with a filename that predict.py resolves per season), or fall back to the last available prior-season league mean when `season-1` is absent from the table. Separately, the inference guard should reject an all-NaN trained feature the same way it rejects a missing one \u2014 that is what would have surfaced this."
+ },
+ {
+  "severity": "high",
+  "category": "train-serve-skew",
+  "title": "f_team_proe_centered is NaN for 100% of live rows all 2026 season (league table has no 2026 row)",
+  "file": "gridlib/features.py",
+  "line": 822,
+  "failure": "add_team_history centres PROE by mapping each row's season through prior_lg = league_by_season.set_index('season')['league_off_proe'].shift(1). predict.py:74 hardcodes LEAGUE = 'league_season_2016_2025_v1.parquet', whose season index stops at 2025, so for any 2026 row the .map() misses and returns NaN. In training, f_team_proe_centered is NaN for only 9.64% of rows (all of 2016, the first season). At serve for 2026 it is NaN for 609 of 609 rows. Every 2026 projection therefore routes that feature down the missing-value branch the model learned from 2016 rows alone. The weekly CI job runs build_team_week.py --seasons 2026-2026, which writes league_season_2026_2026_v1.parquet, a file predict.py never reads, so this never self-heals: it holds for the whole 2026 season and every season after.",
+  "fix": "Fall back to the last available prior season rather than relying on the season being present in the index, e.g. build prior_lg by reindexing onto the row seasons with method='ffill' after the shift, or have predict.py load a league table that is regenerated to include the current season (and bump/parameterise the LEAGUE filename so the weekly job actually refreshes what predict.py reads). Then retrain or re-verify, since training rows were never NaN outside 2016."
+ },
+ {
+  "severity": "high",
+  "category": "test-coverage",
+  "title": "_prior_mean_skipna (the NGS/PFR history builder) has no test; removing its current-row subtraction leaves the suite green",
+  "file": "gridlib/features.py",
+  "line": 334,
+  "failure": "_prior_mean_skipna builds every f_career_ngs_* and f_career_pfr_* feature (features.py:399, reached when USE_NGS/USE_PFR are on). Its safety comes entirely from `- filled` and `- present`, which exclude the current row's value and its presence. Dropping both subtractions makes each of those features include the player's own current-game measured rate - a straight outcome leak - and no test notices. The sibling _prior_mean is covered (mutating its fillna(0.0) away fails 2 tests), so the coverage stops one function short of the ones that are actually unprotected.",
+  "fix": "Add the mirror of test_prior_history_does_not_inherit_current_row_missingness for _prior_mean_skipna: a two-player frame where one player's rate is present in every game and the other's is missing in the games he was untracked, asserting that row i's value depends only on rows < i and that a present current value never appears in its own feature."
+ },
+ {
+  "severity": "high",
+  "category": "test-coverage",
+  "title": "feature_columns() is untested; the three \"per-target feature set\" tests only read the committed registry JSON",
+  "file": "gridlib/features.py",
+  "line": 928,
+  "failure": "features.feature_columns(df, target) is what decides each model's column list at train time, including the DVP exclusion for QB passing targets (features.py:926-928). The three tests in the block headed \"Per-target feature sets: the third instance of train/serve skew\" (tests/test_leakage.py:469, 479, 494) all go through _registry() (line 460), which reads the checked-in models/registry_m1.json. They assert properties of a static file, so they pass no matter what feature_columns does and only turn red after somebody retrains. Disabling the exclusion outright leaves the suite green - the exact skew the block was written for is unguarded until a retrain has already produced the bad artifacts.",
+  "fix": "Add a direct test: build a frame carrying f_dvp_* and f_career_* columns plus the PREGAME block, then assert feature_columns(df, \"passing_yards\") contains no DVP_PREFIX column while feature_columns(df, \"receiving_yards\") does, and that both are subsets of feature_columns(df, None)."
+ },
+ {
+  "severity": "high",
+  "category": "repeated-full-frame-copy",
+  "title": "DataFrame.assign inside the 18-iteration stat loop deep-copies the whole growing feature frame each time",
+  "file": "gridlib/features.py",
+  "line": 410,
+  "failure": "add_player_history loops over the 18 VOLUME_STATS. On each iteration it calls `out.assign(_k=...)` purely to attach a temporary grouping key. Under the pinned pandas 2.3.3 with copy-on-write OFF (verified: `pd.options.mode.copy_on_write` is False, and requirements.txt pins pandas==2.3.3 deliberately), `DataFrame.assign` calls `self.copy(deep=None)`, which for a non-CoW BlockManager resolves to deep=True \u2014 a full data copy. The frame being copied grows from 183 to 251 columns across the loop, so each copy is 130-180 MB. Measured directly on a 63,042 x 251 frame: one `assign` call added 154 MB of RSS and `np.shares_memory` between parent and result was False. A/B over the whole loop: with the assign it costs 4.60 s and 879 MB peak; replacing it with a precomputed key Series and a direct groupby costs 1.30 s and 541 MB peak. Isolating just this change (rolling left as shipped) gives 927 MB peak vs 525 MB \u2014 the assign alone is ~400 MB of the cold-request peak.",
+  "fix": "Build the (gsis_id, season) key once before the loop and use it directly, with no frame copy:\n    key = out[\"gsis_id\"].astype(str) + \"_\" + out[\"season\"].astype(str)   # once, above the loop\n    ...\n    v = out[col].astype(float).fillna(0.0)\n    s_sum = v.groupby(key, sort=False).cumsum() - v\n    s_n   = out.groupby(key, sort=False).cumcount().astype(float)\nVerified to produce identical values."
+ },
+ {
+  "severity": "high",
+  "category": "per-group-python-loop",
+  "title": "_prior_roll_mean uses groupby().apply() per player group, 36 times over ~4,700 groups",
+  "file": "gridlib/features.py",
+  "line": 355,
+  "failure": "_prior_roll_mean calls `groupby(...).apply(lambda s: s.shift(1).rolling(window, min_periods=1).mean())`, which runs the lambda once per gsis_id group \u2014 roughly 4,700 Python-level calls, each constructing an intermediate Series, then reassembling with a concat and an index reset. add_player_history calls it 36 times (18 VOLUME_STATS x ROLL_WINDOWS of (3, 8)), so ~170,000 per-group Python invocations per feature build. Measured: this accounts for 3.89 s of the 4.60 s add_player_history spends (isolated A/B: apply ON with the assign removed = 3.89 s, apply replaced with the vectorised equivalent = 1.30 s), i.e. roughly 3x the runtime of the function that dominates the 22 s cold request.",
+  "fix": "Do the shift and the roll as two grouped ops with no Python callback:\n    v = df[col].astype(float).fillna(0.0)\n    g = df[key]\n    return (v.groupby(g, sort=False).shift(1)\n             .groupby(g, sort=False).rolling(window, min_periods=1).mean()\n             .reset_index(level=0, drop=True))\nVerified equal to the current output (including the NaN pattern)."
+ },
+ {
+  "severity": "high",
+  "category": "train-serve-skew",
+  "title": "Baseline-served TD targets are zero-filled per row instead of falling back, so mid-season they serve 0.00 and drop the anytime-TD props",
+  "file": "gridlib/predict.py",
+  "line": 378,
+  "failure": "receiving_tds and rushing_tds FAIL the gate and are served from the season-to-date mean f_std_{target}. The fallback to f_career_{target} is all-or-nothing: it fires only when base.isna().all(). In week 1 every f_std_* is NaN so the fallback fires and the numbers look right, which is why the live 2026 week-1 board is fine. From week 2 onward f_std_* is populated for most rows, isna().all() is False, and every player who has not yet recorded a stat line this season falls through to .fillna(0.0) and is served 0.00 TDs. That is not the baseline the ship gate measured: validate_models.py:162 fills a NaN baseline-2 with the training-set target mean, not with zero. Downstream, props.py:895 does `if lam <= 0: continue` on lam = rushing_tds + receiving_tds, so those players' anytime-TD prop lines are silently dropped from the compare table (they are counted as neither refused nor unmatched), and predict.fantasy_score understates them by 6.0 points per expected TD, the largest per-unit weight in the whole formula.",
+  "fix": "Make the fallback per row rather than frame-wide: base = live[f'f_std_{target}'].where(notna, live[f'f_career_{target}']) and only then fill what is still missing, and fill it with the same league constant validate_models.py uses (the training-set mean for those positions) rather than 0.0, so the served baseline is the baseline the gate scored."
+ },
+ {
+  "severity": "high",
+  "category": "silent-degradation",
+  "title": "Baseline target fallback is gated on the whole column being NaN, so mid-season debutants are forced to exactly 0.0 instead of their career rate",
+  "file": "gridlib/predict.py",
+  "line": 376,
+  "failure": "For the two baseline-served targets (rushing_tds, receiving_tds), the declared per-player fallback to f_career_{target} only fires when the ENTIRE f_std_{target} column is NaN, i.e. only in week 1. From week 2 onward any player who has not yet played this season has f_std NaN while the column as a whole is populated, so `base` stays f_std and `.fillna(0.0)` writes a hard 0.0 for him. His career rate is discarded. Downstream, gridlib/props.py:895 does `if lam <= 0: continue`, so his anytime-TD prop is deleted from the board entirely, and {target}_expected is 0 for the coherence gates.",
+  "fix": "Make the fallback per-row, not per-column: `base = live[col].where(live[col].notna(), live.get(fallback))`, and keep NaN (not 0.0) where neither exists so \"no history\" stays distinguishable from \"history of zero\"."
+ },
+ {
+  "severity": "high",
+  "category": "concurrency-memory",
+  "title": "project_week_cached has no in-process memoization or single-flight, so concurrent sessions each run the 1.4 GB build",
+  "file": "gridlib/predict.py",
+  "line": 272,
+  "failure": "project_week_cached is disk-cached only. It is called from app.py:185, pages/Game.py, props_ui._freeze_week (line 95) and props_ui.render_week_record (line 589), and none of those call sites is wrapped in @st.cache_data \u2014 the only four @st.cache_data decorators in the whole app are on _schedule, _depth and _injuries. Streamlit runs each browser session's script in its own thread inside one process, and there is no lock around the build: two visitors arriving within the same 22-second window on a week with no cached parquet both see `dc_fresh(path)` False and both enter project_week, so the process holds two ~1.4 GB working sets at once. On a ~1 GB container that is a guaranteed OOM kill rather than a slow page. Even in the single-user case there is no memoization: with ttl=3600, the build re-runs every hour, and every widget interaction in between (week arrow, season selectbox, theme toggle, opening the Update lines popover) re-reads the parquet and re-runs the whole props path.",
+  "fix": "Wrap the call in a module-level `@st.cache_data(ttl=..., show_spinner=...)` helper in app.py / Game.py (Streamlit serializes concurrent misses on the same key, which gives the single-flight for free), or add an explicit threading.Lock keyed on (season, week) around the build inside project_week_cached."
+ },
+ {
+  "severity": "high",
+  "category": "correctness",
+  "title": "grade() silently drops every probability prop, so 321 of 1022 frozen rows can never enter the record",
+  "file": "gridlib/props.py",
+  "line": 1046,
+  "failure": "For a TD prop, _resolve_stat returns cols = (\"__prob__\", \"rushing_tds\", \"receiving_tds\"). grade() builds vals = [a.get(ACTUAL_MAP.get(c, c)) for c in cols], and ACTUAL_MAP has no \"__prob__\" key, so a.get(\"__prob__\") returns None, the `any(v is None ...)` guard at line 1047 fires, and the row is dropped with `continue`. Every Player Touchdowns / Rush TDs / Rec TDs / Pass+Rush+Rec TDs row is therefore ungradeable. Verified end to end: Ja'Marr Chase, Player Touchdowns 0.5, model leans Less, actual 2 receiving TDs -> grade() returns an EMPTY frame. That is 321 of the 1022 rows in cache/pp_frozen_2026_w01_v1.json, and the module's own docstring calls this block \"the single largest block on the board\". Nothing counts or reports the omission, so the week table's \"Graded\" column just shows a smaller number and props_ui.py:344-348 tells the reader touchdown lines \"hit about 86% of the time\" - a claim the app's own record structurally cannot produce.",
+  "fix": "In grade(), strip the \"__prob__\" sentinel before the ACTUAL_MAP lookup (use cols[1:] when cols[0] == \"__prob__\"), and compare actual >= threshold_for_line(line) rather than actual > line for those rows. week_scorecard's mae must then exclude kind == \"probability\" so a probability is not differenced against a touchdown count."
+ },
+ {
+  "severity": "high",
+  "category": "correctness",
+  "title": "Pass TDs, INT and FG Made still lean from the mean gap, the exact bug the module documents and fixed only for rushing/receiving TDs",
+  "file": "gridlib/props.py",
+  "line": 98,
+  "failure": "props.py:122-135 explains at length that a 0.5/1.5 count line asks P(X >= k), not E[X], and that E[X] sits above P(>=1) for every player. That fix was applied only to rushing_tds/receiving_tds via the \"__prob__\" route. \"pass tds\" (line 98), \"pass touchdowns\" (99), \"interceptions thrown\" (103), \"int\" (104), \"fg made\" (148) and \"field goals made\" (149) are still plain means. uncertainty.prob_over has no calibration row for passing_tds, passing_interceptions or fg_made (calibrated targets are only attempts, carries, completions, passing_yards, receiving_yards, receptions, rushing_yards, targets), so p_over is NaN and the lean falls back to the gap at line 926. On the committed week-1 board, 28 of these 88 lines lean \"More\" while the module's OWN poisson_at_least at the module's OWN threshold_for_line puts P(>=k) below 0.5. All 28 survive filter_pickable, i.e. they are shown on the board as picks.",
+  "fix": "Route these three through the same \"__prob__\" path already built for touchdowns (poisson_at_least(lam, threshold_for_line(line)) against 0.5), or fit ratio calibrations for passing_tds / passing_interceptions / fg_made so prob_over stops returning NaN for them."
+ },
+ {
+  "severity": "high",
+  "category": "access-control",
+  "title": "GRIDIRONVALUE_READONLY does not stop writes: any anonymous visitor can overwrite or delete the shared committed boards",
+  "file": "gridlib/props.py",
+  "line": 615,
+  "failure": "Only `freeze_projections` checks `READ_ONLY` (props.py:673-681). `save_lines` does not, and `props_ui._clear_lines` does not. On Streamlit Community Cloud `/data` does not exist, so `CACHE_DIR` falls back to the repo checkout (gridlib/cache.py:48) and these writes land on the committed `cache/pp_lines_*.json` files that the single shared server process serves to every visitor. Verified with GRIDIRONVALUE_READONLY=1 set: a visitor paste through `resolve_and_persist` -> `save_lines` replaced the 1325-row committed week-1 board with a 1-row attacker board (file shrank 259181 -> 246 bytes), and the always-enabled \"Clear all\" button (props_ui.py:541) deleted the file outright. Because `render_week_record` skips any week whose lines file is missing or empty (props_ui.py:578), deleting them removes those weeks from the public season record and from the out-of-sample hit-rate headline. That is exactly what DEPLOY.md:23 (\"a visitor cannot overwrite the record from the site\"), DEPLOY.md:44 (\"props.save_lines and props.freeze_projections become no-ops\") and the read-only banner shown to users (props_ui.py:501-508, \"cannot be moved by anything pasted here\") promise does not happen.",
+  "fix": "Add the same `from .cache import READ_ONLY; if READ_ONLY: return` early-return to `save_lines`, and guard `_clear_lines` (or disable the Clear all button) with `_read_only()`."
+ },
+ {
+  "severity": "high",
+  "category": "dos-info-disclosure",
+  "title": "A 15-character paste crashes the whole page and prints server file paths",
+  "file": "gridlib/props.py",
+  "line": 231,
+  "failure": "`parse_prizepicks_json` assumes `data[]` and `included[]` hold dicts. Pasting `{\"data\": [\"x\"]}` makes line 231 call `.get` on a str; pasting `{\"included\": {\"a\": 1}}` does the same at line 220. `parse_any` catches only `(json.JSONDecodeError, TypeError, ValueError)` at props.py:349, so AttributeError escapes. `resolve_and_persist` is called at app.py:102 and pages/Game.py:112 BEFORE any UI renders, so the exception replaces the entire page. Verified in the running app: after typing `{\"data\": [\"x\"]}` and clicking Add these lines, document.body contained nothing but the traceback (0 textareas left, no board), including absolute server paths. On the deployed app those read /mount/src/gridironvalue/..., and `.streamlit/config.toml:19` sets showErrorDetails = true so this is what a visitor sees. The session is then unrecoverable: `pp_paste` stays in session_state and is re-parsed on every rerun, but the text area it lives in no longer renders, so there is no way to clear it without a fresh session.",
+  "fix": "Skip non-dict entries (`for p in data: if not isinstance(p, dict): continue`, same for `included`), broaden the except at props.py:349 to `Exception`, and set showErrorDetails = false in .streamlit/config.toml for the public deploy."
+ },
+ {
+  "severity": "high",
+  "category": "estimand",
+  "title": "passing_tds, passing_interceptions and fg_made are compared as a MEAN against a half-point line, the exact estimand error the file documents for anytime TDs",
+  "file": "gridlib/props.py",
+  "line": 98,
+  "failure": "props.py:129-141 explains that a 0.5 TD line asks P(X>=1) and that E[X] sits above it for every player, and routes rush/rec TDs through \"__prob__\". The same three low-count integer stats are left on the mean-vs-line rule: \"pass tds\" (line 98), \"interceptions thrown\"/\"int\" (lines 103-104) and \"fg made\"/\"field goals made\" (lines 148-149). None of them has a fitted ratio distribution either - build_prob_calibration.py SPECS covers only attempts, completions, passing_yards, carries, rushing_yards, targets, receptions, receiving_yards - so prob_over returns NaN, the median substitution at props.py:943 never runs, and lean falls back to `diff > 0` at props.py:928. For a 0.5 line no distributional assumption is even needed: for any non-negative integer X, E[X] = sum_{k>=1} P(X>=k) >= P(X>=1), so E[INT] > 0.5 does not imply P(INT>=1) > 0.5. On the committed frozen week-1 board, re-scoring with the module's own poisson_at_least at threshold_for_line(line) puts 9 of 32 Pass TDs rows, 12 of 26 INT rows and 7 of 30 FG Made rows on the wrong side - 28 wrong-sided rows out of 88. Examples: Patrick Mahomes INT model 0.62 vs 0.5 -> \"More\", but P(INT>=1) = 0.462 -> Less. Brock Purdy Pass TDs model 1.53 vs 1.5 -> \"More\", but P(>=2) = 0.452 -> Less. Over-dispersion, which the file notes at props.py:797, pushes P(>=k) further down and so adds flips rather than removing them.",
+  "fix": "Route these three through the same \"__prob__\" path already used for rush/rec TDs: P(X >= threshold_for_line(line)) vs 0.5. They are Poisson-loss models (train_models.py SPECS), so poisson_at_least is the consistent choice."
+ },
+ {
+  "severity": "high",
+  "category": "silent-drop",
+  "title": "grade() silently discards every probability prop, so 31% of the frozen board never enters the accuracy record",
+  "file": "gridlib/props.py",
+  "line": 1046,
+  "failure": "For a touchdown prop _resolve_stat returns cols = (\"__prob__\", \"rushing_tds\", \"receiving_tds\"). grade() iterates the full tuple including the sentinel: ACTUAL_MAP.get(\"__prob__\", \"__prob__\") is not a box-score column, a.get(\"__prob__\") returns None, and line 1047 `continue`s the row. Every probability prop is dropped, with no counter and no message. On the committed frozen 2026 week-1 board that is 321 of 1022 rows (287 Player Touchdowns, 13 Rec TDs, 12 Rush TDs, 9 Pass+Rush+Rec TDs) - by the module's own docstring the single largest block on the board. The record table in props_ui.py:604-612 then prints Shown=1022 next to Graded=~700 with nothing explaining the gap, and season_record() at props.py:1093 is computed over the surviving stats only. grade() explicitly skips (\"__fantasy__\",) at line 1041 but has no equivalent handling for \"__prob__\".",
+  "fix": "In grade(), detect cols[0] == \"__prob__\", sum the actual counts over cols[1:], and grade actual > line as usual; or at minimum count the skipped rows into a meta field the record table can report."
+ },
+ {
+  "severity": "high",
+  "category": "silent-degradation",
+  "title": "77 of 1325 posted lines disappear from compare() with no counter; `meta[\"unmatched_players\"] += 0` is a literal no-op",
+  "file": "gridlib/props.py",
+  "line": 908,
+  "failure": "compare() drops two whole categories of line without recording them: a matched player whose projection for that stat is NaN (the `+= 0` line, which increments nothing), and a touchdown prop whose lambda is 0 (line 895 `continue`). On the saved 2026 week 1 board, posted=1325 but matched(1022) + unmatched_players(13) + refused(213) + unmapped(0) = 1248, leaving 77 lines that no counter in `meta` ever sees. render_board's \"none matched\" explanation (props_ui.py:265-277) can only cite unmatched_players, unmapped_stats and refused, so those 77 can never be explained to the reader - which is exactly the failure the module docstring's rule 5 forbids.",
+  "fix": "Add real counters (e.g. meta[\"unprojected_stat\"] and meta[\"zero_rate_td\"]), assert posted == matched + sum(all buckets) in a test, and surface both in render_board's explanation. A P(>=1) of 0.00 is a legitimate answer for a zero-rate player; showing it is more honest than deleting the row."
+ },
+ {
+  "severity": "high",
+  "category": "test-coverage",
+  "title": "rank_by_reliability - the board's entire ordering - has zero tests; reversing the sort changes nothing in the suite",
+  "file": "gridlib/props.py",
+  "line": 561,
+  "failure": "rank_by_reliability (props.py:525) is called from compare() at props.py:995 and is the only thing that orders the board. Its docstring argues at length that the old secondary key was \"the wrong quantity twice over\", and it now carries three separate code paths: tier rank, |p_over - 0.5| for mean rows, |model - 0.5| for probability rows, and a diff_pct/400 fallback. Nothing in tests/ names it. Flipping the sort so the least trustworthy, closest-to-a-coin-flip rows come first - the exact state the function exists to prevent - passes 259/259.",
+  "fix": "Test it directly on a hand-built table: a 'negative' tier row with a huge diff must sort below a 'best' tier row with a small one; within one tier a p_over of 0.80 must sort above 0.55; a probability row must be ranked by |model - 0.5|, not by diff_pct; a row with p_over NaN must fall back to |diff_pct|/400 rather than to 0."
+ },
+ {
+  "severity": "high",
+  "category": "name-join",
+  "title": "grade() joins the frozen picks to actuals on a suffix-stripped player NAME and silently drops collisions, mis-grading the accuracy record",
+  "file": "gridlib/props.py",
+  "line": 1035,
+  "failure": "_actuals_for() returns the whole week's box score (all positions), and grade() keys it with normalize_name, which strips generational suffixes (props.py:172, _SUFFIX matches jr|sr|ii|iii|iv|v), then calls drop_duplicates(\"_key\") and keeps whichever row came first in the file. In 2025 week 12 the box score has \"Michael Carter II\" (CB, PHI, 0 rushing yards) at row 11601 and \"Michael Carter\" (RB, ARI, 28 rushing yards, 30 receiving yards) at row 11651; both normalize to \"michael carter\", and the dedup keeps the cornerback. A frozen PrizePicks pick on the Cardinals back -- say rushing yards 24.5 with a More lean -- is graded against 0 rushing yards, recorded as Less, and the model is marked wrong. The record is frozen at first sight, so the error is permanent. The same collision exists in 2025 wk4 and wk18, 2024 wk17 (Michael Carter), and 2024 wks 1-11 (DJ Turner WR LV vs DJ Turner CB CIN). compare() at line 861 and collapse_alt_lines() at line 363 use the identical name-only key, and the parsed lines already carry `team` and `position` (props.py:334) that would disambiguate.",
+  "fix": "Key on gsis_id wherever it exists. The compared table already resolves a projection row (which carries gsis_id), so carry that id through compare() into the frozen record and grade against actuals on gsis_id. Where a name key is unavoidable (the pasted PrizePicks text), widen the key to name|team|position and count a genuine collision in meta[\"unmatched_players\"] rather than dropping it silently."
+ },
+ {
+  "severity": "high",
+  "category": "stale-copy",
+  "title": "Game page unconditionally renders \"Per-player projections are not built yet\" directly below the per-player projections it just rendered",
+  "file": "pages/Game.py",
+  "line": 190,
+  "failure": "pages/Game.py:138-163 loads predict.project_week_cached(), builds props_ui.props_by_name() and renders every matching player's projected Model / Line / Gap / Lean under his depth-chart row; pages/Game.py:166 then renders the full \"Model vs market\" ledger for the game. pages/Game.py:190 appends, outside any conditional, a notice claiming those projections do not exist yet and describes them as a future milestone (\"They arrive once the models clear walk-forward validation\"). The loop at pages/Game.py:207-208 renders it every time. On the shipped 2026 week-1 data, CLE at JAX shows 39 projected rows in the ledger plus per-player rows in both depth charts, and then tells the reader none of it is built. The same notice also asserts \"Every number this site eventually shows is the mean of a modelled distribution\", which is wrong for the numbers on the page above it (see the median/probability finding).",
+  "fix": "Delete the notice (and the matching claim in the module docstring at pages/Game.py:7-11, which says \"Per-player projections are NOT here yet\")."
+ },
+ {
+  "severity": "high",
+  "category": "doc-drift",
+  "title": "Game page tells every visitor \"Per-player projections are not built yet\" directly beneath the projections",
+  "file": "pages/Game.py",
+  "line": 191,
+  "failure": "The notice list is appended unconditionally on every game page render. A visitor opens /Game, sees each player's projected line and the model-vs-market ledger rendered at lines 141-166 and 175, and then reads a boxed notice saying the projections do not exist yet and \"will\" arrive after validation. The module docstring at line 7 says the same thing. Both describe the pre-step-4 state of the page.",
+  "fix": "Delete the notice and rewrite the module docstring; if a caveat is wanted, replace it with the reliability-tier language the ledger already uses."
+ },
+ {
+  "severity": "high",
+  "category": "false-user-facing-claim",
+  "title": "Every game page unconditionally states \"Per-player projections are not built yet\" directly beneath the per-player projections it just rendered",
+  "file": "pages/Game.py",
+  "line": 190,
+  "failure": "pages/Game.py builds real projections at line 138 (`predict.project_week_cached`), renders each player's model-vs-line block inside his depth-chart row (lines 141-163), and renders the full model-vs-market ledger at line 166. Then at line 190 it appends, with no guard of any kind, a notice reading \"Per-player projections are not built yet. They arrive once the models clear walk-forward validation ... The depth chart above is the opportunity picture those projections will be built on.\" The models shipped (models/registry_m1.json, trained_through 2025, 16 targets with gate verdicts). So on every single game page a reader sees Model/Line/Gap/Lean numbers and is then told by the site that no projections exist. A reader who believes the notice discounts real numbers; a reader who believes the numbers concludes the site's own disclaimers are decorative. The page docstring (lines 7-11) is stale in the same way.",
+  "fix": "Delete the note (and the stale docstring paragraph), or gate it on `predict.load_registry() is None`."
+ },
+ {
+  "severity": "high",
+  "category": "readonly-guard",
+  "title": "Any visitor can wipe the published accuracy record: \"Clear all\" and `save_lines` are not guarded by GRIDIRONVALUE_READONLY",
+  "file": "props_ui.py",
+  "line": 494,
+  "failure": "`render_input` is rendered on the deployed site on both pages (app.py:111, pages/Game.py:120). Its \"Clear all\" button (props_ui.py:542-545) is enabled whenever `props.saved_weeks(season)` is non-empty, which on the deployment is always true because `cache/pp_lines_2026_w01_v1.json` is committed. Clicking it calls `_clear_lines`, which `unlink()`s every `pp_lines_*.json` in CACHE_DIR with no READ_ONLY check. `render_week_record` (props_ui.py:577-579) skips any week where `props.load_lines` returns None and returns early if no rows survive, so the entire week-by-week record and season headline disappear for every visitor hitting that container until Streamlit Cloud restarts it. `props.save_lines` (gridlib/props.py:599) is likewise unguarded and deliberately writes under READ_ONLY, so a pasted board also MERGES into and overwrites the committed lines file for that week (props_ui.py:65-68). Only `freeze_projections` checks READ_ONLY (gridlib/props.py:675-676). This contradicts the guarantee the deployment states in two places: DEPLOY.md (\"a visitor cannot overwrite the record from the site\") and the read-only notice shown to visitors at props_ui.py:506-512 (\"it stays the same for everyone and cannot be moved by anything pasted here\").",
+  "fix": "Guard `_clear_lines` (and the button itself) on `gridlib.cache.READ_ONLY`, and either guard `save_lines` on a read-only host or write visitor pastes to a session-scoped path so they cannot overwrite the committed `pp_lines_*.json`."
+ },
+ {
+  "severity": "high",
+  "category": "correctness",
+  "title": "\"Clear all\" is not READ_ONLY-guarded and wipes the committed boards on the public deployment",
+  "file": "props_ui.py",
+  "line": 495,
+  "failure": "_clear_lines unlinks every props.lines_path(season, w) with no READ_ONLY check, and render_input renders the button unconditionally (the read-only branch at line 505 only adds an st.info). On Streamlit Community Cloud /data does not exist, so cache.py:48 sets CACHE_DIR to the repo's own ./cache inside the container, which is writable - and cache/pp_lines_*.json is a COMMITTED artifact (.gitignore:53). So any visitor clicking \"Clear all\" deletes the published boards for everyone: render_board falls back to \"No PrizePicks lines loaded for this week\", and render_week_record skips every week at props_ui.py:578 (`if ln is None or ln.empty: continue`), so the whole season record and week-by-week table vanish until the container restarts. DEPLOY.md:24-25 claims \"a visitor cannot overwrite the record from the site\"; verified false.",
+  "fix": "Guard _clear_lines with the same `from gridlib.cache import READ_ONLY` early return that freeze_projections uses (props.py:675-683), and disable the button when _read_only() is true."
+ },
+ {
+  "severity": "high",
+  "category": "correctness",
+  "title": "A re-paste can never update a line that moved; the stale line always wins",
+  "file": "props_ui.py",
+  "line": 66,
+  "failure": "resolve_and_persist merges with pd.concat([existing, batch]) - existing always first - then collapse_alt_lines sorts on [\"_key\",\"_rank\"] and drop_duplicates(keep=\"first\"). Multi-key sort_values uses np.lexsort, which is STABLE, so among two rows with the same (player, stat) and the same odds_type the previously saved row is always kept. A line that PrizePicks moved from 85.5 to 88.5 is therefore discarded on every re-paste. props.py:653-655 explicitly promises the opposite (\"New lines in that paste are frozen at their own time\") but the moved line never reaches freeze_projections at all, because it is dropped before save_lines. The board and the frozen record keep comparing the model against a number the market no longer posts, and grading scores the stale line.",
+  "fix": "Give collapse_alt_lines an explicit recency key (a paste timestamp column) and sort on [\"_key\", \"_rank\", \"_seen_at\"] descending on the last, or key the merge so a new line_score for an existing (player, stat, odds_type) replaces the old row instead of being deduplicated away."
+ },
+ {
+  "severity": "high",
+  "category": "read-only-contract",
+  "title": "\"Clear all\" is not blocked on the read-only deployment and erases the committed accuracy record for every visitor, contradicting the read-only notice's explicit promise",
+  "file": "props_ui.py",
+  "line": 494,
+  "failure": "_clear_lines unlinks props.lines_path(season, w) for every saved week and is wired to the \"Clear all\" button at props_ui.py:541 with `disabled=not props.saved_weeks(season)` only. READ_ONLY is checked in exactly one place in the codebase, gridlib/props.py:676 inside freeze_projections; nothing guards deletion. On Streamlit Community Cloud /data does not exist, so CACHE_DIR falls back to the repo's ./cache (gridlib/cache.py:48), and .gitignore lines 53-54 whitelist cache/pp_lines_*.json and cache/pp_frozen_*.json, so the record ships as committed files in that exact directory. render_week_record (props_ui.py:576-580) skips any week where props.load_lines() returns None or empty, so deleting the lines files makes `rows` empty, the function returns at props_ui.py:621, and both the \"Season record, out of sample\" panel and the \"Week by week\" table vanish for every visitor until the container is recycled. Meanwhile the read-only notice rendered three lines above the same button (props_ui.py:506-512) tells the user: \"The accuracy record is separate: it only changes when the site is updated, so it stays the same for everyone and cannot be moved by anything pasted here.\"",
+  "fix": "Gate _clear_lines on gridlib.cache.READ_ONLY (return early, and disable the button with a help string saying why), the same way freeze_projections is gated."
+ },
+ {
+  "severity": "high",
+  "category": "stale-copy",
+  "title": "Three places tell the reader every displayed number is a mean; the Model column is the MEDIAN for the eight calibrated targets and a PROBABILITY for touchdown props",
+  "file": "props_ui.py",
+  "line": 375,
+  "failure": "gridlib/props.py:935-940 replaces model_val with uncertainty.median_projection() for every single-column mean prop that has a fitted ratio distribution, and _fmt_gap's own docstring (props_ui.py:443) states \"THE GAP IS ONLY SAFE TO SHOW BECAUSE MODEL IS NOW THE MEDIAN\". For touchdown props gridlib/props.py:901 sets the value to poisson_at_least(), a probability, rendered as a percentage by _fmt_model (props_ui.py:430). Yet the ledger footnote (props_ui.py:375), the site-wide footer on every page (gridlib/theme.py:853) and the About page's opening claim (pages/About.py:42) all say the numbers are means. The gap is not cosmetic: median_projection's own docstring gives receiving yards a median of 0.68-0.90 of the mean, and the shipped calibration artifact is worse than that at the low end. So a reader told \"a projection of 68 receiving yards ... the average is about 68\" is being handed a number that can be roughly half the mean, described as the mean.",
+  "fix": "Correct the three strings to say the Model column is the median outcome where a fitted distribution exists, a probability for touchdown props, and a mean elsewhere; or carry the per-row quantity in the ledger the way `kind` already is."
+ },
+ {
+  "severity": "high",
+  "category": "redundant-computation",
+  "title": "line_counts_by_game runs the whole-week props.compare once per game, 16 times, for data the single whole-week table already carries",
+  "file": "props_ui.py",
+  "line": 128,
+  "failure": "line_counts_by_game groups the projections by game_id and calls props.compare(lines, gp, reg) inside the loop. compare iterates the FULL pasted board (1,325 rows in the committed 2026 week 1 file) for every group, so the pasted board is walked 16 times. Immediately afterwards app.py:190 calls props_ui.render_board, which runs props.compare over the whole week a 17th time \u2014 and compare's output already contains a `game_id` column (verified: `\"game_id\" in table.columns` is True), so the per-game counts are a groupby away from the table that is computed anyway. Measured on one home-page render: line_counts_by_game 1.76 s versus 0.60 s for a single whole-week compare. This 1.76 s is paid on every rerun, including a theme toggle, because nothing on this path is cached.",
+  "fix": "Compute the whole-week table once, share it with render_board, and derive the counts:\n    table, meta = props.compare(lines, scope_proj, reg)\n    pickable, _ = props.filter_pickable(table)\n    counts = pickable.groupby(\"game_id\").size().to_dict()"
+ },
+ {
+  "severity": "high",
+  "category": "doc-drift",
+  "title": "Ledger footnote says the Model column is a distribution mean; the code sixty lines above says it is the median",
+  "file": "props_ui.py",
+  "line": 375,
+  "failure": "For receiving yards with a projected mean of 60.0, the ledger prints Model 53.9 (median ratio 0.898) and the footnote under it says \"Model values are distribution means\". A reader comparing the printed number to any other mean-based figure, or summing it, is off by 10% on receiving/rushing yards and far more at low projections (mean 10.0 -> median 4.7, ratio 0.471).",
+  "fix": "Change the footnote to say the Model column is the median of the modelled distribution (the mean is what the models estimate and what aggregates use)."
+ },
+ {
+  "severity": "high",
+  "category": "overstated-measurement",
+  "title": "Every edge number on the board is quoted without the proxy-line caveat that the measurement itself demands",
+  "file": "props_ui.py",
+  "line": 185,
+  "failure": "The side_edge_pts values in data/stat_reliability.csv are copied verbatim from docs/lean_probability.csv (attempts 10.4 = 10.412, completions 7.8 = 7.798, passing_yards 9.0 = 8.994, receptions 5.2 = 5.178, targets 5.1 = 5.102, carries 4.2 = 4.196, receiving_yards 2.6 = 2.639, rushing_yards 1.8 = 1.770). Those were measured against a line PROXIED by the player's season-to-date per-game mean, because no historical PrizePicks lines exist. The generating script says in its own header that a real line is sharper and that these must be read as \"an OPTIMISTIC ceiling, not an expectation\". The two places the number reaches the user say nothing of the kind. Concrete: a user hovers the \"strong\" badge on any of the 32 strong-tier rows on the live week-1 board and reads \"Measured side-picking edge +10.4 points against always taking the more common side, out of sample\" -- which reads as +10.4 points against a posted market line, the exact claim the measurement cannot support. The tooltip also omits that only 461 QB-games backed that number. The CSV even carries a `measured_on` column recording the protocol, and it is never rendered anywhere.",
+  "fix": "Add the proxy-line sentence to both the tier tooltip and the low-tier notice (\"measured against a season-to-date-average line, not a book line, so it is a ceiling\"), and surface `measured_on` so the reader knows the protocol and the season."
+ },
+ {
+  "severity": "high",
+  "category": "estimand",
+  "title": "Availability grid counts bye-week depth-chart rows as \"did not appear\", deflating every p_play cell by about 6%",
+  "file": "scripts/build_availability.py",
+  "line": 102,
+  "failure": "The grid is built from every (season, week, team, player) row in depth_chart_normalized, with `appeared` = membership in the player-week table. Depth charts are published in a team's BYE week too, and in a bye week nobody appears, so all those rows score appeared=False. Verified on 2025: 645 of 12,099 chart rows (5.3%) are for a team that played no game that week. The served estimand is P(appears | the team is playing) -- build_inference_rows only creates rows for teams in that week's schedule -- so every cell is biased low. Recomputing the grid with bye rows excluded raises every cell: RB1 0.867 -> 0.917, WR1 0.824 -> 0.871, QB1 0.829 -> 0.877, TE1 0.823 -> 0.870; mean ratio across all 29 cells is 0.941. Since predict.py:421 computes {target}_expected = {target} * p_play, every unconditional projection and every team aggregate the coherence checks run on is about 6% low, in the same direction for every player.",
+  "fix": "Before computing `appeared`, inner-join dc against the set of (season, week, team) pairs that actually have a scheduled REG game, so bye weeks never enter the denominator. Then re-run and re-check the printed \"expected appearances per team-week\" against the 11.9 box-score average, which is also computed over bye weeks today and so hides the bias."
+ },
+ {
+  "severity": "high",
+  "category": "false-guard",
+  "title": "The altitude sanity guard fires on a correct build: Denver's first 2026 home game is week 2, so the weekly CI refresh will abort after week 1",
+  "file": "scripts/build_player_week.py",
+  "line": 499,
+  "failure": "The guard raises whenever a built season has no stadium_id in {DEN00, MEX00}, on the reasoning that \"Denver hosts games in every season\". But build_season only sees games that have been PLAYED (stats_player_week only carries played weeks), and .github/workflows/weekly.yml rebuilds the current season every Tuesday starting from week 1. The 2026 schedule puts Denver's first home game in week 2 (2026_02_JAX_DEN, 2026-09-20) and the Mexico City game in week 11, so the Tuesday 2026-09-15 run -- the first in-season refresh -- builds a correct week-1-only table, hits this raise, and the workflow step fails. No current-season file is committed, and predict.project_week then falls back to the frozen 2016-2025 history, which is exactly the silent degradation the workflow exists to prevent. Reproduced against three historical seasons whose first high-altitude game was also week 2 or later.",
+  "fix": "Test what the guard actually means: assert that the stadium_id join matched, e.g. df[\"stadium_id\"].isna().mean() == 0, and only assert the presence of DEN00 when a DEN home game is inside the built week range (compare against the schedule's played DEN00 games for the same weeks)."
+ },
+ {
+  "severity": "high",
+  "category": "silent-skip",
+  "title": "The only train/serve parity test disables itself in exactly the failure mode it guards: a dead depth-chart feed reports \"258 passed, 1 skipped\"",
+  "file": "tests/test_leakage.py",
+  "line": 390,
+  "failure": "test_predict_refuses_to_serve_with_missing_features is the one test that actually compares the registry's feature list against build_inference_rows output (verified: removing out[\"is_starter\"] from predict.py:210 fails it and nothing else). It calls build_inference_rows(2026, 1) and does `if rows.empty: skip`. build_inference_rows returns an empty frame whenever fetch.latest_depth_chart is empty for every team - which is what happened once already per fetch.py:339-343 (the 2025 depth-chart schema dropped the `week` column). In that state project_week returns an empty frame too, so the site serves no projections at all, and the suite reports one silent skip and zero failures. The raw depth-chart/schedule/players parquets are gitignored (.gitignore `cache/*` un-ignores only the derived artifacts), so on a fresh clone this test's outcome also depends on live nflverse.",
+  "fix": "Split the parity check off the network: build a fixture depth chart and schedule and drive build_inference_rows against it so the column list is checked deterministically, then keep the live call as a separate @pytest.mark.network test. Replace the `rows.empty` skip with a failure - an empty inference frame for a scheduled week is the bug, not a missing prerequisite."
+ },
+ {
+  "severity": "high",
+  "category": "name-body-mismatch",
+  "title": "test_inference_rows_derive_every_feature_the_backfill_does never calls build_inference_rows",
+  "file": "tests/test_leakage.py",
+  "line": 359,
+  "failure": "The docstring describes the shipped skew precisely (\"they were added to the backfill, the models trained on them, and build_inference_rows never computed them\"), but the body only asserts {\"depth_rank_capped\", \"is_starter\"} is a subset of the BACKFILL's columns. It touches neither gridlib/predict.py nor the registry, so it would have passed unchanged for the entire lifetime of the bug it documents. Verified: deleting the is_starter derivation from build_inference_rows fails only test_predict_refuses_to_serve_with_missing_features; this test stays green.",
+  "fix": "Either delete this test as redundant with the registry check, or give it the body its name promises: assert set(build_inference_rows(...).columns) >= (backfill-derived pregame columns), driven off a fixture so it does not need the network."
+ },
+ {
+  "severity": "high",
+  "category": "tautology",
+  "title": "test_missing_depth_rank_does_not_crash_or_assume_starter asserts only 0 <= p <= 1, so it cannot detect the assumption it names",
+  "file": "tests/test_leakage.py",
+  "line": 347,
+  "failure": "attach_p_play maps a missing depth_rank to the deepest bucket (predict.py:110, `.fillna(MAX_RANK)`), which is the conservative choice. The test's only assertion is `0.0 <= out[\"p_play\"].iloc[0] <= 1.0`, true of every probability. Changing the fill to 1 - so every player the depth chart does not rank is treated as a starter, inflating p_play and every {target}_expected aggregate built from it at predict.py:421 - passes the whole suite.",
+  "fix": "Assert the relationship, not the range: p_play for depth_rank NaN must equal p_play for depth_rank MAX_RANK, and must be strictly below p_play for depth_rank 1."
+ },
+ {
+  "severity": "medium",
+  "category": "test-infrastructure",
+  "title": "No CI runs the test suite; the only workflow rebuilds and commits data",
+  "file": ".github/workflows/weekly.yml",
+  "line": 1,
+  "failure": ".github/workflows/ contains exactly one file, weekly.yml, which installs requirements, rebuilds the current-season team-week and player-week tables, runs an inline column-count sanity check, and commits. There is no pytest step and no other workflow. So the 260 tests - including every leakage and train/serve-parity test - gate nothing automatically, and the weekly bot commits a regenerated player_week_<season>_v1.parquet straight to the repo without the leakage suite ever running against it. The bot's own check only compares column NAMES against the history; a column that arrives populated with same-game values would pass it.",
+  "fix": "Add a workflow running `pytest -m \"not network\"` on push and pull_request, and add the same step to weekly.yml between the rebuild and the commit so a regenerated table cannot be committed while the leakage suite is red."
+ },
+ {
+  "severity": "medium",
+  "category": "deploy-config",
+  "title": "Self-hosted webfonts 404 on every page: static serving is never enabled",
+  "file": ".streamlit/config.toml",
+  "line": 11,
+  "failure": "gridlib/theme.py declares both variable fonts with `src:url('/app/static/fonts/*.woff2')`, but Streamlit only mounts the `app/static/{path}` route when `server.enableStaticServing` is true (default False in the pinned streamlit==1.59.1). `.streamlit/config.toml`'s `[server]` block sets only `headless = true`, so the route does not exist and the catch-all returns the SPA `index.html` with `Content-Type: text/html` for both font URLs. The browser cannot parse HTML as woff2, so both @font-face rules fail and the whole site renders in the fallback stack (`-apple-system, sans-serif`) \u2014 including every `font-family:'Space Grotesk'` heading, stat number and pill in theme.py. The two woff2 files are committed and shipped in the clone, so nothing looks missing.",
+  "fix": "Add `enableStaticServing = true` under `[server]` in .streamlit/config.toml (the files are already in `static/fonts/` next to app.py, which is where Streamlit expects them)."
+ },
+ {
+  "severity": "medium",
+  "category": "correctness",
+  "title": "The TD baseline fallback is all-or-nothing, so mid-season it serves 0.00 receiving/rushing TDs for every player with no game yet this season",
+  "file": "/Users/barrettcollins/Desktop/Claude/NFL Predict/gridlib/predict.py",
+  "line": 376,
+  "failure": "receiving_tds and rushing_tds FAIL the ship gate, so `project_week` serves the season-to-date baseline `f_std_{target}`. The fallback to `f_career_{target}` fires only when `base.isna().all()` \u2014 i.e. week 1, when nobody has a season-to-date value. From week 2 on the column is partly populated, `.all()` is False, the career fallback is skipped entirely, and every row whose f_std is NaN falls through to `.fillna(0.0)`. Those are exactly the players with no stat line yet this season: returning from injury, just promoted, just signed. On a real 2025 week 10 board (542 live rows) 75 rows (13.8%) are served receiving_tds = 0.00 and rushing_tds = 0.00, and 50 of those have a perfectly good `f_career_` value the code names as the fallback and then discards \u2014 Joe Mixon at 0.541 career rushing TDs per game served as 0.00, Brandon Aiyuk at 0.362 receiving TDs per game served as 0.00. Both columns feed `fantasy_score` at weight 6.0 (predict.py:431-432), so Mixon's PrizePicks composite is understated by ~3.2 points, and against a posted Fantasy Score line that manufactures a confident Under.",
+  "fix": "Combine the two per row instead of choosing one series for the whole frame: `base = pd.to_numeric(live[col], errors=\"coerce\").fillna(pd.to_numeric(live[fallback], errors=\"coerce\"))`, and only then `.fillna(0.0)`. Add a test that a live row with a NaN f_std and a populated f_career is served the career value, not zero."
+ },
+ {
+  "severity": "medium",
+  "category": "doc-drift",
+  "title": "DEPLOY.md's runtime file list omits both calibration artifacts, whose absence silently reverts the board to the retired gap rule",
+  "file": "DEPLOY.md",
+  "line": 69,
+  "failure": "\"What the running app needs\" lists models/, player_week, league_season, availability and data/*.csv. It does not list cache/prob_calibration_v1.parquet or cache/mean_calibration_v1.parquet. Deploy exactly that set and uncertainty.table() returns None, prob_over returns NaN for every row, so props.compare never overrides the lean (props.py:952 `if kind == \"mean\" and np.isfinite(p_over)`) and never substitutes the median (props.py:941). The site then serves means with gap-based leans \u2014 the configuration measured at -5.4 on receiving yards and -7.7 on rushing yards \u2014 with one WARNING log line and no visible change.",
+  "fix": "Add the two calibration parquets to the runtime list and their build scripts to the rebuild block, and correct \"the four cache artifacts\"."
+ },
+ {
+  "severity": "medium",
+  "category": "wrong-number",
+  "title": "Bye-week notice hardcodes the 18-week schedule and a 32-team league, so it is wrong for every season before 2021 and miscounts byes for 1999-2001",
+  "file": "app.py",
+  "line": 178,
+  "failure": "The season selectbox is populated from the full schedule feed, which gridlib/fetch.py:151 documents as \"All seasons 1999-present\" and which really does span 1999-2026. app.py:174 computes on_bye = 32 - len(games) * 2 and app.py:178-180 renders \"<b>{on_bye} teams are on bye this week.</b> Every team has one bye, so a player plays 17 games across 18 weeks.\" Two failures: (a) 1999-2001 had 31 teams, so 1999 week 3 with 14 games has 3 teams idle but the notice says 4; (b) 1999-2020 were 16-game / 17-week seasons, so on every pre-2021 week the sentence asserts a schedule shape that season never had. app.py's own _weeks_for docstring at app.py:60 already knows this (\"seasons through 2020 had 17 weeks and 2021+ have 18\"), so the page contradicts itself.",
+  "fix": "Derive the team count from the season's own schedule rows (len(set(home)|set(away))) instead of the constant 32, and build the sentence from _weeks_for(season) rather than hardcoding 17/18."
+ },
+ {
+  "severity": "medium",
+  "category": "unimplemented-claim",
+  "title": "\"No market line\" notice claims a neutral-game-script fallback and widened uncertainty; neither exists in the code",
+  "file": "app.py",
+  "line": 198,
+  "failure": "app.py:196-199 tells the reader that games without a posted total get \"a neutral game script instead of a market-implied one, which widens their uncertainty.\" gridlib/predict.py:185-191 sets team_implied_total / opp_implied_total straight from the game row and team_spread to np.nan when spread_line is missing; there is no neutral substitution, and grep for fillna over those columns in gridlib/features.py returns nothing that touches them. The values are simply MISSING and handed to the booster's native NaN path. Nor is any uncertainty widened: gridlib/uncertainty.prob_over() keys only on (target, projection value) via _row_for(), so a game with no posted line produces a probability, a lean and a gap computed identically to a game with one, and nothing on the ledger or the card marks those rows. A user reading the notice during a week where lines have not posted believes the affected projections are flagged as wider; they are indistinguishable.",
+  "fix": "Either implement the neutral fallback plus a widening term, or reword the notice to say the market features are missing for those games and that the model falls back to its non-market signal."
+ },
+ {
+  "severity": "medium",
+  "category": "doc-drift",
+  "title": "backfill.md gives the player-week table 125 columns; it has 177",
+  "file": "docs/backfill.md",
+  "line": 11,
+  "failure": "The artifact table documents `player_week_2016_2025_v1.parquet` as 63,042 rows and 125 columns. The committed file has 177 columns \u2014 52 more, added by the NGS, PFR, weather, bio, venue and referee work. Anyone using this table to check a rebuild for column loss (which is exactly what .github/workflows/weekly.yml guards against) has a target 52 columns short.",
+  "fix": "Update the column count, or generate the row from the artifact."
+ },
+ {
+  "severity": "medium",
+  "category": "doc-drift",
+  "title": "backfill.md says only 12 columns are directly safe as features; 39 are",
+  "file": "docs/backfill.md",
+  "line": 151,
+  "failure": "\"Only 12 columns are directly safe: the market ..., the venue (roof_type, surface), and the schedule (is_home, rest_days, div_game, gameday, weekday).\" columns.safe_feature_columns over the built table returns 39, including the whole injury, depth-rank, bio, venue-encoding and weather blocks added later. A reader auditing the leak surface would look at 12 columns and miss 27, several of which (report_status, depth_rank, wx_*) carry their own availability caveats.",
+  "fix": "Regenerate the count and the list from columns.safe_feature_columns, or state the count as of a date."
+ },
+ {
+  "severity": "medium",
+  "category": "doc-drift",
+  "title": "columns.py claims weather is served from a forecast feed; no forecast call exists and the artifact has zero rows for the served season",
+  "file": "gridlib/columns.py",
+  "line": 127,
+  "failure": "The PREGAME block justifies classifying wx_* as pregame with \"training values are OBSERVED weather, serving values are FORECAST weather\". scripts/build_weather.py defines FORECAST but never calls it \u2014 every request goes to ARCHIVE, and the archive is capped at yesterday (`cutoff` at line 133). The built artifact contains 2,761 games, none from 2026. If USE_WEATHER were ever flipped on, live rows would carry NaN for all six columns: the exact train/serve skew the module exists to prevent.",
+  "fix": "Either wire the FORECAST endpoint for future kickoffs or amend the comment to say the forecast path is not built and wx_* is training-only until it is."
+ },
+ {
+  "severity": "medium",
+  "category": "point-in-time",
+  "title": "Depth-chart snapshots are bucketed by the week's FIRST kickoff, so every chart published after Thursday night is attributed to the following week and discarded",
+  "file": "gridlib/fetch.py",
+  "line": 384,
+  "failure": "_attach_week_from_timestamp builds boundaries from each week's earliest kickoff (line 376-380) and searchsorted(side=\"left\") assigns a snapshot to the week whose first kickoff is the earliest at or after it. A snapshot taken Friday of week N is after week N's Thursday-night kickoff, so it is labelled week N+1. depth_chart_normalized then keeps the LAST snapshot per (team, week), which for week N is the one published just before Thursday's game. Verified on 2025: the week-5 bucket spans 2025-09-26 07:14Z to 2025-10-02 07:15Z, while week 5's Sunday games kick off 2025-10-05 20:05Z. The file publishes one snapshot per day, so the Friday (10-03), Saturday (10-04) and Sunday-morning (10-05) charts -- the ones carrying the final Friday injury designations and any promotion caused by them -- land in week 6's bucket and are never used for week 5. latest_depth_chart() filters on the same `week` column, so the live board on Sunday of week N shows a chart that is 3.5 days stale. This directly contradicts the reason depth rank is a feature at all (build_player_week.py:253-256: \"carries availability news EARLIER than the injury report\").",
+  "fix": "Bucket a snapshot by the next kickoff of the TEAM it describes, or at minimum bound weeks by each week's LAST kickoff plus a small margin rather than its first, so Friday/Saturday charts stay in the week whose games they precede. Whatever rule is chosen must be identical in latest_depth_chart, since training and serving both read this column."
+ },
+ {
+  "severity": "medium",
+  "category": "stale-beats-empty",
+  "title": "load_release treats a successful but empty fetch as good data, overwriting the cache and returning empty in violation of the module's stale-beats-empty doctrine",
+  "file": "gridlib/fetch.py",
+  "line": 123,
+  "failure": "The module docstring (lines 25-30) promises the loader \"never returns empty when stale exists\". The implementation only guards `fresh is not None`: a 200 response carrying a zero-row parquet passes that guard, is written over the previously good cache via atomic_to_parquet, and is returned. For the whole-history files that reuse one filename forever -- games.parquet, players.parquet, officials.parquet, ngs_*.parquet -- that permanently replaces good data with an empty frame until an unrelated good fetch happens to land. load_schedules() likewise only checks `df is None` (line 158), so it returns the empty frame instead of raising, and week_games() then renders \"no games this week\" on a live board. A truncated write on the publisher's side or a proxy returning an empty body is enough to trigger it; the code has no defence.",
+  "fix": "Change the guard to `if fresh is not None and not fresh.empty:`, and when a fetch comes back empty while a non-empty cached copy exists, log and serve the stale copy instead of writing. Make load_schedules raise on an empty frame as well as on None."
+ },
+ {
+  "severity": "medium",
+  "category": "ineffective-guard",
+  "title": "The missing-feature guard cannot detect an f_ feature that fails to derive, because the concat with history supplies every backfill column",
+  "file": "gridlib/predict.py",
+  "line": 350,
+  "failure": "The guard raises only when a registry feature name is absent from live.columns. But live is sliced out of combined = pd.concat([hist, inf]) (line 339), and hist is the ten-year backfill, so every column the backfill carries exists in live no matter what the inference path did: the constructed rows just get NaN. The guard therefore fires only for a column that exists in NEITHER table, which is the one case that cannot happen for anything derived inside features.build. The block's own comment says the failure mode is 'a tree model turns a NaN into a learned default branch', and that is exactly what it cannot catch. Verified instance: f_team_proe_centered is NaN for all 609 live 2026 week-1 rows and `missing` is empty, so project_week ran to completion and wrote cache/predictions_2026_w01_m1.parquet (mtime 2026-09-06 01:28) with no error. The same holds for the per-target check at line 389. tests/test_leakage.py:377 only checks that build_inference_rows emits the PREGAME names, so nothing in the suite covers an f_ column that is present but wholly missing.",
+  "fix": "Add an all-NaN (or near-all-NaN) check on the live slice for every registry feature column, not just a name-presence check: any trained column whose live rows are 100% NaN while the training table had it populated is the same silent-drop failure and should raise with the column name."
+ },
+ {
+  "severity": "medium",
+  "category": "correctness",
+  "title": "\"Anytime TD\" is refused even though STAT_MAP has a working probability mapping for it",
+  "file": "gridlib/props.py",
+  "line": 164,
+  "failure": "\"anytime td\" appears in BOTH STAT_MAP (line 137, mapped to the ((\"__prob__\", \"rushing_tds\", \"receiving_tds\"), 1.0) probability route) and REFUSE (line 164, \"a probability, not a mean; needs a scoring model\"). _resolve_stat checks REFUSE first at line 825, so REFUSE always wins: the STAT_MAP entry at line 137 is dead code and every board that words the prop \"Anytime TD\" instead of \"Player Touchdowns\" is rejected with a reason that has been false since the probability path shipped. compare() then files it under meta[\"refused\"], and render_board prints it under the notice \"Longest-anything props are maxima over plays, and a mean-projection model cannot price a maximum\" (props_ui.py:288-289), which is the wrong explanation for a touchdown prop.",
+  "fix": "Delete the \"anytime td\" entry from REFUSE (line 164). The probability route at line 137 already handles it, and \"player touchdowns\" / \"pass+rush+rec tds\" prove the path works."
+ },
+ {
+  "severity": "medium",
+  "category": "correctness",
+  "title": "77 of 1325 lines are dropped with no counter, so an empty board cannot explain itself",
+  "file": "gridlib/props.py",
+  "line": 908,
+  "failure": "compare() has two silent drop paths. Line 895 `if lam <= 0: continue` drops a probability prop for any player with no projected TDs, uncounted. Line 908 is a literal no-op, `meta[\"unmatched_players\"] += 0  # matched player, unprojected stat`, which adds nothing to any bucket. On the committed week-1 board that is 70 + 7 = 77 lines: posted 1325 minus refused 213 minus unmatched 13 minus unmapped 0 = 1099, but matched = 1022. render_board's warn_on_empty explanation (props_ui.py:257-273) can only cite unmatched_players, unmapped_stats and refused, so a board made entirely of these rows falls through to the generic \"No line resolved to a projected player and stat.\" This is exactly the failure the module's own rule 5 forbids (\"Never let a saved-but-unmatched board render as silence. Say why it matched nothing\").",
+  "fix": "Add real counters, e.g. meta[\"unprojected_stat\"] and meta[\"zero_rate\"], increment them at lines 895 and 908, and surface both in render_board's bits list so the counts reconcile to `posted`."
+ },
+ {
+  "severity": "medium",
+  "category": "robustness",
+  "title": "A single unparseable line_score throws away the entire pasted feed",
+  "file": "gridlib/props.py",
+  "line": 252,
+  "failure": "parse_prizepicks_json builds each row with float(a[\"line_score\"]) inside the loop, unguarded. One row whose line_score is not numeric raises ValueError, which aborts the whole loop. parse_any catches ValueError at line 349, logs \"JSON parse failed\", and falls through to parse_prizepicks_board on the JSON text, which returns zero rows. So one bad row out of 1300 discards the entire paste and the UI tells the user \"Nothing readable in that paste. Paste the feed JSON or the board text.\" (props_ui.py:55-56) for a feed that was almost entirely valid.",
+  "fix": "Wrap the float() in a per-row try/except and increment a skipped counter (the same one already exposed as df.attrs[\"skipped_noname\"], or a sibling), so one malformed row costs one line rather than the whole board."
+ },
+ {
+  "severity": "medium",
+  "category": "dos",
+  "title": "Quadratic regex on a pasted line: 800KB of text burns minutes of CPU in the shared server process",
+  "file": "gridlib/props.py",
+  "line": 269,
+  "failure": "`_BOARD_SUFFIX = re.compile(r\"(Demon|Goblin)+$\")` is applied with `.sub()` to a whole pasted line at props.py:316. When the line is a long run of `Demon` that does not end at the anchor, the engine retries from every start offset, giving O(n^2). Measured end-to-end through `props.parse_any` on the paste `\"John Smith\\n120\\n\" + \"Demon\"*n + \"!\\nz\\n\"`: 20KB -> 0.29s, 40KB -> 1.10s, 80KB -> 4.61s. Extrapolating the measured quadratic, an 800KB paste (well inside what st.text_area accepts) costs roughly 8 minutes of CPU. On the public deployment this is unauthenticated: the paste box at props_ui.py:530 is open to every visitor, and Streamlit Community Cloud runs one small container for all of them, so repeating this starves the whole app.",
+  "fix": "Anchor without the ambiguous repeat, e.g. `re.compile(r\"(?:Demon|Goblin)+\\Z\")` still backtracks; use `re.compile(r\"(Demon|Goblin)*$\")` on a length-capped line, or simply cap line length (a real stat label is < 64 chars) before the sub, and cap the total paste size in resolve_and_persist."
+ },
+ {
+  "severity": "medium",
+  "category": "dead-branch",
+  "title": "\"anytime td\" is in both REFUSE and STAT_MAP, and REFUSE wins, so the prop is rejected with a reason that is no longer true",
+  "file": "gridlib/props.py",
+  "line": 164,
+  "failure": "STAT_MAP gained \"anytime td\" -> (\"__prob__\", \"rushing_tds\", \"receiving_tds\") at line 137 when the scoring model was added, but the older REFUSE entry at line 164 was never removed. _resolve_stat checks REFUSE first (props.py:824), so the STAT_MAP entry is unreachable. A pasted board that labels the prop \"Anytime TD\" - the standard sportsbook wording, and a label PrizePicks itself has used - produces zero rows and a notice saying \"a probability, not a mean; needs a scoring model\", while the identical prop labelled \"Player Touchdowns\" is priced and shown. The 2026 week-1 board happens to use \"Player Touchdowns\" for all 368 of them, so the breakage is latent rather than visible today.",
+  "fix": "Delete the \"anytime td\" entry from REFUSE now that the probability path exists."
+ },
+ {
+  "severity": "medium",
+  "category": "silent-degradation",
+  "title": "freeze_projections returns a non-zero \"rows frozen\" count even when json_save silently failed to write anything",
+  "file": "gridlib/props.py",
+  "line": 719,
+  "failure": "cache.json_save catches every exception from the write and only logs. freeze_projections builds `existing`, increments `added`, calls json_save, and returns `added` unconditionally without checking that anything landed. On a full or non-writable CACHE_DIR the function reports e.g. 529 rows frozen while the snapshot file is unchanged. On the next render load_frozen returns None, render_week_record falls through to `basis = \"recomputed\"` (props_ui.py:589-592) and grades that week's old board against the CURRENT model - precisely the drift the freeze mechanism exists to prevent, with only a \"Basis\" cell to signal it. No caller can distinguish a successful freeze from a failed one.",
+  "fix": "Have json_save/pkl_save/atomic_to_parquet return a bool (or raise) and have freeze_projections return 0 / raise when the write did not land. save_lines has the same shape."
+ },
+ {
+  "severity": "medium",
+  "category": "test-coverage",
+  "title": "The paste -> route -> save -> freeze pipeline has no test; route_to_weeks decides which week the accuracy record is filed under",
+  "file": "gridlib/props.py",
+  "line": 743,
+  "failure": "props.route_to_weeks is called once, from props_ui.resolve_and_persist (props_ui.py:60), and it decides the week key under which every pasted line is saved and frozen. Its logic is non-trivial: a +/-6h window against each game's kickoff, a mode() over the matches, a dict whose keys are ints mixed with the string \"_unrouted\", and a fallback to the caller's week. Nothing in tests/ names route_to_weeks, resolve_and_persist or _freeze_week. _freeze_week additionally wraps everything in `except Exception` and returns 0 (props_ui.py:106-108), so any failure to snapshot the model's number is logged at WARNING and the paste appears to succeed - the record just silently has no frozen projection for that week. The freeze tests (test_props.py:730 onward) all call props.freeze_projections directly and bypass this path.",
+  "fix": "Test route_to_weeks against a synthetic schedule: a board carrying a Thursday game and the following Sunday's games must split into two int keys; a line with a null start_time must land under \"_unrouted\"; a line whose start_time matches no game must not silently join the nearest week. Then test resolve_and_persist end to end with dc_path monkeypatched, asserting each line is saved under its own game's week and that _freeze_week ran for each destination."
+ },
+ {
+  "severity": "medium",
+  "category": "stale-copy",
+  "title": "\"anytime td\" is refused despite having a working mapping, and the refusal notice explains every refusal reason as \"maxima over plays\"",
+  "file": "gridlib/props.py",
+  "line": 164,
+  "failure": "_resolve_stat (gridlib/props.py:824-826) checks REFUSE before STAT_MAP, so the STAT_MAP entry added at gridlib/props.py:137 (\"anytime td\" -> (\"__prob__\", \"rushing_tds\", \"receiving_tds\")) is dead: the key always returns the stale refusal \"a probability, not a mean; needs a scoring model\", which is precisely the thing the __prob__ branch was built to do. Worse, render_board (props_ui.py:283-290) concatenates every refused key under one hardcoded explanation. REFUSE holds five distinct reasons, so a board carrying Tackles, Sacks, First TD Scorer or an Anytime TD tab renders: \"Not priced: tackles (N), anytime td (M). Longest-anything props are maxima over plays, and a mean-projection model cannot price a maximum.\" Tackles are not a maximum over plays and neither is an anytime touchdown; the per-key reason the dict already stores is discarded.",
+  "fix": "Remove the \"anytime td\" entry from REFUSE so the STAT_MAP mapping takes effect, and render meta['refused'] as key + its own stored reason instead of one blanket sentence."
+ },
+ {
+  "severity": "medium",
+  "category": "safety-gate-fails-open",
+  "title": "The in-sample guard on the accuracy record fails open: a missing model registry labels every week \"In sample: no\" and folds training-season weeks into the out-of-sample record",
+  "file": "gridlib/props.py",
+  "line": 1071,
+  "failure": "is_in_training_window() returns False when `registry` is None (props.py:1071-1072), and predict.load_registry() returns None whenever models/registry_m1.json is missing or unreadable (predict.py:129-131). props_ui.py:603 gates the season record on `not props.is_in_training_window(season, reg)` and props_ui.py:615 sets the \"In sample\" column the same way. Frozen snapshots are committed to the repo (.gitignore:54 `!cache/pp_frozen_*.json`; cache/pp_frozen_2026_w01_v1.json is git-tracked), so `basis == \"frozen\"` does not require the registry. Concrete failure: a deploy where the model artifacts fail to load (LFS miss, partial checkout, corrupt JSON) while a committed 2025 snapshot is present renders every 2025 week as \"In sample: no\" and folds those graded rows -- the model grading its own training data -- into the headline \"Season record, out of sample\", with a Wilson interval and possibly the \"an edge, on this evidence\" verdict. The docstring at props.py:1066-1069 says exactly why that must never happen.",
+  "fix": "Fail closed: with no registry, treat the window as unknown, exclude the week from the record, and label the row \"unknown\" rather than \"no\"."
+ },
+ {
+  "severity": "medium",
+  "category": "mislabelled-quantity",
+  "title": "The footer, the About page and the caption under the ledger all say every number is a mean, but the ledger's Model column is the median for eight targets and a probability for touchdowns",
+  "file": "gridlib/theme.py",
+  "line": 853,
+  "failure": "props.py:942-946 replaces model_val with `median_projection(...)` whenever a calibration row exists, which covers attempts, carries, completions, passing_yards, receiving_yards, receptions, rushing_yards and targets (cache/prob_calibration_v1.parquet). props.py:897 sets model_val to P(TD >= k) for touchdown props, and props_ui.py:430 renders those as a percent. Yet the footer on every page says \"Every number shown is the mean of a modelled distribution\", the copyright line repeats it, About.py:42 opens with \"Every number here is a mean, not a prediction\", and props_ui.py:375 puts \"Model values are distribution means, not forecasts\" directly under the table. The distinction is material and the codebase knows it: uncertainty.py:209 records that for receiving yards the median is 0.68 to 0.90 of the mean. Concrete: a reader sees \"Receiving Yards, Model 44.0, Line 42.5\", is told 44.0 is the mean, and reasons that the mean of the distribution is 1.5 above the line; the actual mean is roughly 49-64 and 44.0 is the median. On the live week-1 board this mislabels 701 mean-kind rows (median) and 321 probability rows.",
+  "fix": "Say what the column actually holds: median where a distribution exists, mean otherwise, probability for touchdown rows. The mean-vs-forecast disclaimer is still right in spirit but is now naming the wrong statistic."
+ },
+ {
+  "severity": "medium",
+  "category": "extrapolation",
+  "title": "apply_level's left clamp INFLATES the smallest projections, the opposite of the bias it exists to correct",
+  "file": "gridlib/uncertainty.py",
+  "line": 117,
+  "failure": "np.interp is called with left=mapped[0], a hard clamp, while the right edge got an explicit ratio carry-forward at lines 119-131 precisely because clamping there would be wrong. The fitted grid starts at p.min() of the walk-forward sample, not at 0, and the isotonic map is not near-identity there: for receiving_yards grid[0]=0.3650 but mapped[0]=2.3689, so every raw prediction in [0, 0.365) - including an exact 0 - is served as 2.369 receiving yards, a 6.5x inflation. That also lifts it over MIN_PRED=0.25, so uncertainty's probability layer starts pricing a player the model projected at zero instead of returning NaN. targets maps 0 -> 0.2427 and receptions 0 -> 0.1505 the same way. This is the reverse of the documented purpose (uncertainty.py:88-92, \"the lowest projection quintile is over-projected by 10-25%\"). Evidence the clamp actually binds: the shipped prob_calibration_v1.parquet has receiving_yards bin 0 lo = 2.3689320388, byte-identical to mapped[0], i.e. the clamp was the minimum of the entire four-season fitted sample. It does not bind on the currently cached 2026 w1 predictions (min served 2.519), so today it is latent.",
+  "fix": "Mirror the right-edge treatment: below grid[0], carry the bottom-of-grid ratio (arr * mapped[0]/grid[0]) so the map passes through the origin, or extend the fitting grid down to 0."
+ },
+ {
+  "severity": "medium",
+  "category": "dead-code",
+  "title": "VALIDATED_MAX is a documented display cap that is referenced nowhere; no test would notice",
+  "file": "gridlib/uncertainty.py",
+  "line": 64,
+  "failure": "The comment above it states the behaviour as shipped: \"The display caps at this value and says '80%+' rather than printing a precise number the calibration cannot stand behind.\" A repo-wide grep (excluding .venv/.git/cache) finds the identifier only at its own definition and in its own comment. props_ui._fmt_model and the board renderer never import it, so the ~11 rows a week the comment describes as above 80% (one at 91%) are printed at full precision as if measured. No test references VALIDATED_MAX at all, so the gap between the documented policy and the code is invisible to the suite.",
+  "fix": "Either apply it in the display path (clamp the printed probability and render \"80%+\") and add a test that a 0.91 p_over renders as \"80%+\" while ranking still uses 0.91, or delete the constant and the comment so the docs stop describing behaviour that does not exist."
+ },
+ {
+  "severity": "medium",
+  "category": "hidden-deepcopy",
+  "title": "Calibration parquet carries a 199-element attrs list that pandas deep-copies on every derived object inside _row_for",
+  "file": "gridlib/uncertainty.py",
+  "line": 148,
+  "failure": "scripts/build_prob_calibration.py:162 sets `out.attrs[\"quantiles\"] = QUANTILES.tolist()` \u2014 a 199-float Python list \u2014 and that dict survives the parquet round-trip (verified: `U.table().attrs` is non-empty at serve time). pandas propagates attrs through `NDFrame.__finalize__`, which does a `copy.deepcopy` of the attrs dict for every object derived from that frame. _row_for performs several such derivations per call (a boolean mask on target, a second mask on lo/hi, `.iloc[0]`, and on the miss path `nsmallest`/`nlargest`), so each call deep-copies the 199-element list several times. props.compare calls _row_for twice per mean-prop row (prob_over at props.py:931 and median_projection at props.py:945): 2,754 calls per 3 compares in a profile that showed 4,645,401 deepcopy calls and _row_for accounting for 5.96 s of the 8.0 s total. Unprofiled, _row_for costs 0.43 ms per call; clearing attrs on the same table makes it 2.3x faster (0.859 s vs 0.373 s for 2,000 calls). At 17 compares per home-page render that is roughly half a second per rerun spent copying a constant list.",
+  "fix": "Either stop writing the attrs in build_prob_calibration.py (the quantile grid is already stored per row in the `q_grid` column), or strip it on load in uncertainty.table() (`t.attrs = {}` before caching). Better still, pre-index the table once into a dict keyed by target so _row_for does no DataFrame masking at all."
+ },
+ {
+  "severity": "medium",
+  "category": "dead-doc",
+  "title": "VALIDATED_MAX documents a display cap (\"80%+\") that no code implements, and the probability is no longer displayed at all",
+  "file": "gridlib/uncertainty.py",
+  "line": 61,
+  "failure": "The comment says \"The display caps at this value and says '80%+' rather than printing a precise number the calibration cannot stand behind.\" Nothing reads VALIDATED_MAX anywhere in the repo, and the board stopped printing the probability entirely (commit 534848a, \"Show the gap instead of the chance percentage\"). A maintainer trusting this comment believes an over-confidence guard is in place that does not exist.",
+  "fix": "Delete VALIDATED_MAX and its comment, or reinstate the cap if a probability is ever printed again."
+ },
+ {
+  "severity": "medium",
+  "category": "doc-drift",
+  "title": "apply_level says five of eight targets have no map; four do have one",
+  "file": "gridlib/uncertainty.py",
+  "line": 99,
+  "failure": "The docstring says \"Returns `pred` unchanged for any target without a map, which is five of the eight tested.\" The shipped artifact carries maps for four of the eight, so three pass through, not five. A reader auditing which projections are level-corrected gets the wrong count and could miss that `receptions` is corrected.",
+  "fix": "Change \"five of the eight\" to \"four of the eight\"."
+ },
+ {
+  "severity": "medium",
+  "category": "stale-copy",
+  "title": "About page says no availability model exists; the availability grid ships, is loaded on every projection, and is adjusted by the injury report",
+  "file": "pages/About.py",
+  "line": 81,
+  "failure": "pages/About.py:77-81 is headed \"One thing this does not yet do, and it matters\" and closes \"Until an availability model exists, read every line as 'if he plays'.\" gridlib/predict.py:93-121 attaches p_play from cache/availability_2025_2025_v1.parquet (29 rows, committed, built by scripts/build_availability.py) and multiplies it by INJURY_ADJ from the live injury report; gridlib/predict.py:421 writes {target}_expected = p_play * conditional for every target; p_play is even frozen into the accuracy record (gridlib/props.py:689). The model exists and runs on every page load. What is actually true is the deliberate design decision documented at gridlib/predict.py:33-42: the board shows E[Y|plays] unmultiplied on purpose, because deflating by p_play against a line that voids on a scratch would manufacture a fake Under. The About page presents that decision as a missing feature, so a reader is told the site cannot do something it does, and is not told the thing it does do (p_play is computed and never surfaced anywhere in the UI).",
+  "fix": "Rewrite the paragraph to say the board deliberately shows the conditional number because a prop voids on a scratch, and that p_play exists and is used for aggregates; drop \"until an availability model exists\"."
+ },
+ {
+  "severity": "medium",
+  "category": "doc-drift",
+  "title": "About page says no availability model exists; predict.py ships one and serves p_play",
+  "file": "pages/About.py",
+  "line": 81,
+  "failure": "The About page tells readers \"Until an availability model exists, read every line as 'if he plays'\" under a heading \"One thing this does not yet do\". The availability model exists, is committed, and runs on every projection: gridlib/predict.py:93-120 attaches p_play from the shrunk grid and predict.py:420-421 emits `{target}_expected`. A reader concludes the site has no handle on availability at all.",
+  "fix": "Rewrite to say the availability factor exists as p_play and is deliberately kept out of the displayed prop number, which is the conditional E[Y | plays]."
+ },
+ {
+  "severity": "medium",
+  "category": "contradictory-guidance",
+  "title": "About calls rushing and receiving yards \"Worth reading\" while the board tags the same two stats \"weak\", and About never mentions side-picking at all",
+  "file": "pages/About.py",
+  "line": 63,
+  "failure": "About's \"How much to trust each number\" table is built entirely from central-accuracy (MAE) results and gives \"Passing, rushing and receiving yards ... 5 to 13% better | Worth reading\". But MAE is not the question a prop asks, which the codebase states repeatedly (gridlib/props.py:473-478: receiving yards beats the baseline on MAE by 5.1% and LOSES on side-picking by 5.7 points under the old rule). data/stat_reliability.csv rates receiving_yards and rushing_yards \"weak\" with side-picking edges of +2.6 and +1.8 points, the two smallest on the board, and their own notes call them \"the weakest of the repaired props\". A reader who visits About first is told the yards props are worth reading, then meets grey \"weak\" badges on 127 Receiving Yards and 64 Rush Yards rows on the live week-1 board, with no reconciliation anywhere. About contains no side-picking numbers at all, so the measurement that actually governs a prop decision is absent from the page whose stated job is \"an honest account of which numbers are worth reading\".",
+  "fix": "Add a side-picking column (or a second table) to About driven off data/stat_reliability.csv, so the verdict a reader takes to the board is the verdict the board shows."
+ },
+ {
+  "severity": "medium",
+  "category": "stale-user-facing-claim",
+  "title": "About states no availability model exists, but one ships, is injury-adjusted, and its p_play is computed and frozen per line yet never shown",
+  "file": "pages/About.py",
+  "line": 81,
+  "failure": "About tells the reader \"One thing this does not yet do, and it matters ... Until an availability model exists, read every line as 'if he plays'.\" An availability model does exist and is live: cache/availability_2025_2025_v1.parquet is git-tracked, predict.attach_p_play (predict.py:93-121) reads it, applies INJURY_ADJ {Out: 0.02, Doubtful: 0.25, Questionable: 0.92} from the pregame injury report, and project_week attaches p_play at predict.py:407. compare() carries p_play into every ledger row (props.py:982-984) and freeze_projections persists it (props.py:689). Nothing in props_ui.py or pages/ ever reads it -- grep for p_play across props_ui.py, pages/ and gridlib/store.py returns nothing. Concrete: a player listed Out has p_play = 0.02 in the frozen record, and the game page still renders his full block of Model/Line/Gap/Lean rows under a heading that reads \"Projected to play\" (pages/Game.py:131), while About assures the reader the site has no way to know. The site knows, writes the number down, and shows neither the number nor the fact that it has it.",
+  "fix": "Correct the About paragraph (the model exists; the DISPLAYED number is still conditional on playing, which is the part that stays true), and surface p_play on the row -- at minimum flag rows below some threshold rather than leaving an Out player's leans unmarked."
+ },
+ {
+  "severity": "medium",
+  "category": "correctness",
+  "title": "\"Clear all\" is immediately undone by resolve_and_persist re-parsing the still-populated paste box",
+  "file": "props_ui.py",
+  "line": 44,
+  "failure": "_clear_lines is wired as an on_click callback (line 541), and Streamlit runs callbacks BEFORE the script body. The script body then starts at app.py:102 / pages/Game.py:112 with props_ui.resolve_and_persist, which reads st.session_state[\"pp_paste\"] unconditionally - there is no \"was the button pressed\" check and nothing ever clears pp_paste. The text_area is re-rendered every run (the popover body always executes), so its value survives. Sequence: user pastes, clicks Add, lines save; user clicks Clear all; the callback deletes the files; the rerun re-parses the same text and saves every line straight back. The button appears to do nothing until the user also empties the text box.",
+  "fix": "Have _clear_lines also set st.session_state[\"pp_paste\"] = \"\", and/or gate resolve_and_persist's merge on st.session_state.get(\"pp_add\") so a paste is applied once rather than on every rerun."
+ },
+ {
+  "severity": "medium",
+  "category": "correctness",
+  "title": "The slate-card pill and the week record count rows the board then withholds (filter_informed is skipped)",
+  "file": "props_ui.py",
+  "line": 132,
+  "failure": "render_board applies filter_pickable AND filter_informed (lines 295-298) and returns the post-both count. line_counts_by_game (line 132), props_by_name (line 151) and render_week_record (line 596) apply only filter_pickable. So the micro-pill on a slate card promises more lines than the game page renders - the exact failure the comment at props_ui.py:129-131 says the count exists to prevent - the per-player expander shows thin-history props the ledger below suppresses, and the week table's \"Shown\" column reports 529 for a board that renders 512. It also means the graded record includes the 17 thin-history rows the site explicitly refuses to show as \"the model's ignorance rather than the market's\".",
+  "fix": "Apply filter_informed alongside filter_pickable in line_counts_by_game, props_by_name and render_week_record, so all four surfaces count the same rows."
+ },
+ {
+  "severity": "medium",
+  "category": "swallowed-exception",
+  "title": "_freeze_week's bare `except Exception` swallows project_week's deliberate train/serve-parity RuntimeError",
+  "file": "props_ui.py",
+  "line": 104,
+  "failure": "project_week raises RuntimeError on purpose (predict.py:357 and 391) when a column the models trained on cannot be derived at inference - the guard the module docstring calls \"Do NOT fail open\", added after depth_rank_capped/is_starter and the bio block each shipped as silent skews. _freeze_week wraps that call in `except Exception`, logs a warning to a logger whose default level is WARNING to stderr (invisible on Streamlit Cloud), and returns 0. resolve_and_persist (props_ui.py:70) then discards the return value. Because route_to_weeks files a midweek paste under the week of each line's OWN game, _freeze_week routinely runs for a week the page never renders, so a parity break in that other week is caught by nothing else and produces no user-visible signal at all - the paste reports success and the accuracy record simply never gains those rows.",
+  "fix": "Catch only the expected \"nothing to project yet\" conditions (empty projection / missing depth chart) and let RuntimeError propagate, or re-raise it after logging. At minimum, surface the failure in the paste UI instead of discarding _freeze_week's return."
+ },
+ {
+  "severity": "medium",
+  "category": "inconsistency",
+  "title": "The graded season record and the rendered board apply different filters, so the record grades picks the site refuses to show",
+  "file": "props_ui.py",
+  "line": 596,
+  "failure": "render_board applies filter_pickable AND filter_informed before showing anything, and prints a note explaining that thin-history rows are withheld because \"ranking a board by the size of the gap would put exactly those rows on top\". render_week_record applies only filter_pickable, reports that larger number as \"Shown\", and grades it into the headline \"Season record, out of sample\". _freeze_week freezes the raw compare() output with neither filter. On 2026 week 1 that is 529 counted/graded against 512 actually displayed: 17 rows the site explicitly says it will not show are nonetheless in the record and in the MAE columns.",
+  "fix": "Apply the same filter pair in one helper used by render_board, render_week_record, line_counts_by_game and props_by_name, so \"a pick\" has exactly one definition."
+ },
+ {
+  "severity": "medium",
+  "category": "header-mismatch",
+  "title": "Ledger header prints the pre-filter match count above a table rendered from the post-filter set: \"1022 lines on week 1\" over 512 rows",
+  "file": "props_ui.py",
+  "line": 279,
+  "failure": "render_board writes the window header at props_ui.py:277-281 using len(table) where `table` is the raw output of props.compare(). filter_pickable is not applied until props_ui.py:295 and filter_informed until props_ui.py:298, and only then is _ledger_html(table) rendered at props_ui.py:318. On the shipped 2026 week-1 board the header therefore reads \"1022 lines on week 1\" while the ledger below it contains 512 rows. The same function returns the post-filter count (props_ui.py:380), which app.py:206 uses as _matched, so the value the function reports and the value it prints disagree by 2x. On a game page the same header is drawn from the unfiltered per-game slice, so it disagrees with both the ledger below it and the count on the card the user clicked.",
+  "fix": "Move the header render below the two filters and use the filtered length, or label it \"1022 matched, 512 shown\"."
+ },
+ {
+  "severity": "medium",
+  "category": "count-mismatch",
+  "title": "\"Shown\" column and the per-card line pill both omit filter_informed, so they overstate the ledger they claim to reconcile with",
+  "file": "props_ui.py",
+  "line": 609,
+  "failure": "render_week_record applies only filter_pickable (props_ui.py:596) before writing \"Shown\": len(table) at props_ui.py:609, with the comment \"Count what the board actually SHOWS, so this table reconciles with the ledger above it and with the per-game card pills.\" render_board applies a SECOND filter, filter_informed (props_ui.py:298), which the record does not. line_counts_by_game (props_ui.py:132) has the same omission and the same comment (\"Count only what the game page will actually SHOW\"). Result on the shipped 2026 week-1 board: the \"Week by week\" table says Shown = 529 for week 1 while the \"Model vs market\" ledger rendered immediately above it on the same page contains 512 rows, and 8 of the 16 slate cards advertise more lines than the game page's ledger delivers (CLE at JAX card says 44, ledger shows 39).",
+  "fix": "Apply filter_informed in both places (or factor render_board's filter chain into one helper the record and the pill counts also call)."
+ },
+ {
+  "severity": "medium",
+  "category": "missing-label",
+  "title": "Per-player rows under the depth chart drop the low-confidence and composed provenance badges the ledger shows for the same rows",
+  "file": "props_ui.py",
+  "line": 476,
+  "failure": "_ledger_html (props_ui.py:392-398) emits three provenance badges: \"baseline\", \"low conf\" (source == model_low_confidence) and \"composed\" (source == composite). render_player_lines, which draws the same rows underneath a player's depth-chart entry on the Game page, only emits the baseline one. On the shipped 2026 week-1 board 158 of 529 pickable rows (30%) are composite or model_low_confidence: 100 Fantasy Score, 58 FG Made / Kicking Points / INT. Under a player's own row those render with no provenance marker at all, so a reader who opens Brandon Aubrey sees a Kicking Points line indistinguishable from a passing-yards line served by a gate-passing model. Fantasy Score is the worse case: gridlib/predict.py:446 documents that it \"inherits the touchdown problem: two of the three touchdown terms are served from a baseline\", carrying 6.0 weight each, and it is also the only large block with tier \"unmeasured\", so under the depth chart it carries neither a source badge nor a reliability number.",
+  "fix": "Reuse the ledger's badge branch in render_player_lines rather than special-casing baseline."
+ },
+ {
+  "severity": "medium",
+  "category": "display-precision",
+  "title": "Model rendered at one decimal while the lean is decided at full precision, so 15 of 499 shipped rows display MODEL == LINE with a non-Even lean",
+  "file": "props_ui.py",
+  "line": 431,
+  "failure": "_fmt_model prints the model at one decimal (props_ui.py:431) and _fmt_gap suppresses a gap that rounds to zero (props_ui.py:464-465), but the lean is set from p_over at full precision in gridlib/props.py:952. The stated invariant is that MODEL vs LINE always agrees with LEAN, and at display precision it does not. On the shipped 2026 week-1 board, 15 of 499 pickable mean rows render with the Model and Line cells showing the same number, a Gap cell of \"0.0\" with no colour class, and a Lean of More or Less. Two of them sit in the same table with identical displayed numbers and opposite verdicts: Rome Odunze \"Receptions 3.5 / 3.5 / 0.0 / More\" (p_over 0.5181) and Deebo Samuel \"Receptions 3.0 / 3.0 / 0.0 / Less\" (p_over 0.4940). Nothing on screen distinguishes them. The separate probability-row case is unlabelled too: a Player Touchdowns row renders Model \"0%\", Line \"1.5\" and Gap \"-50pt\", where the Gap is distance from a coin flip rather than from the line and the 0% is P(2 or more TDs) against a 1.5 line, with no key anywhere on the page.",
+  "fix": "Render the model at enough precision to separate it from the line (or print the lean's own basis on the row), and give the probability rows their own footnote naming the threshold and the units of the Gap cell."
+ },
+ {
+  "severity": "medium",
+  "category": "unbounded-work-in-render",
+  "title": "render_week_record can trigger a full 22 s / 1.4 GB projection build per week inside an 18-week loop, and reloads the season box score once per week",
+  "file": "props_ui.py",
+  "line": 589,
+  "failure": "render_week_record (called at the bottom of every app.py render) loops over all 18 weeks. For any week that has saved lines but no frozen snapshot it falls into `proj = predict.project_week_cached(season, w)` \u2014 the 22 s / 1.4 GB build from finding 1, once per such week, inside a page render. That branch is reachable on the deployed site by design, not by accident: save_lines writes on a read-only host (props.py:602-608 says so explicitly) while freeze_projections refuses when READ_ONLY (props.py:675-682), so every board a visitor pastes creates lines with no snapshot. Since predictions_*.parquet is gitignored, a fresh container has no disk cache to fall back on either. Separately, `_actuals_for` is called once per week in the same loop and calls fetch.load_player_week(season) (props_ui.py:659), which is not memoized \u2014 it re-reads the season's stats_player_week parquet 18 times per render.",
+  "fix": "Hoist `fetch.load_player_week(season)` out of the loop (or lru_cache it) and pass the frame to _actuals_for. For the unfrozen branch, do not build projections during a render at all: show the week labelled \"not frozen\" with no recomputed comparison, or gate the recompute behind an explicit user action."
+ },
+ {
+  "severity": "medium",
+  "category": "doc-drift",
+  "title": "_tier_badge docstring quotes the two edge numbers the tier table has since replaced",
+  "file": "props_ui.py",
+  "line": 179,
+  "failure": "The docstring justifies the badge with \"(-5.7 against +10.1 points of side-picking edge)\" for receiving yards vs pass attempts. The tooltip the function actually renders reads `edge` from data/stat_reliability.csv, which now carries +2.6 and +10.4. A maintainer reading the docstring to understand what the badge means gets a receiving-yards edge with the wrong sign.",
+  "fix": "Quote the current CSV values, or drop the numbers from the docstring since the function reads them at runtime."
+ },
+ {
+  "severity": "medium",
+  "category": "false-explanation",
+  "title": "The \"Not priced\" notice gives one blanket reason (\"maxima over plays\") for refusals that were refused for entirely different reasons, and REFUSE silently shadows a working mapping for \"anytime td\"",
+  "file": "props_ui.py",
+  "line": 283,
+  "failure": "props.py:872-875 buckets refusals by stat_type -> COUNT and throws away REFUSE's per-stat reason string. props_ui.py:283-290 then lists the refused stat names and appends one fixed sentence: \"Longest-anything props are maxima over plays, and a mean-projection model cannot price a maximum.\" On the committed 2026 week-1 paste the refused set is {'Sacks': 12, 'Longest Reception': 113, 'Longest Rush': 57, 'Longest Completion': 31}, so the page tells the user that 12 defensive Sacks lines are maxima over plays. REFUSE's real reason for them is \"defensive; not projected in v1\". Separately, _resolve_stat checks REFUSE before STAT_MAP (props.py:825-830), so \"anytime td\" -- which has a working P(TD >= 1) mapping at props.py:137 -- is always refused with the reason \"a probability, not a mean; needs a scoring model\", which is false because the scoring path exists and is used for \"player touchdowns\". A board that uses the \"Anytime TD\" wording instead of \"Player Touchdowns\" therefore drops its single largest block (368 lines on this board) and tells the user they are maxima over plays. Verified: `props._resolve_stat('anytime td')` returns `(None, None, 'a probability, not a mean; needs a scoring model')`.",
+  "fix": "Carry the reason string into meta[\"refused\"] and print each stat with its own reason. Remove \"anytime td\" from REFUSE now that the probability path exists."
+ },
+ {
+  "severity": "medium",
+  "category": "doc-drift",
+  "title": "build_mean_calibration titles and section header say three targets; the SHIPPED dict has four",
+  "file": "scripts/build_mean_calibration.py",
+  "line": 1,
+  "failure": "Line 1 reads \"Isotonic level correction for the three targets where it survives the gate\" and line 33 is a section headed \"WHY ONLY THREE TARGETS\". The SHIPPED dict at lines 59-71 has four entries, and the body of that very section (line 36) correctly says \"It ships for receiving_yards, rushing_yards, targets and receptions.\" The file contradicts itself, and the built artifact has four rows.",
+  "fix": "Change both \"three\" to \"four\"."
+ },
+ {
+  "severity": "medium",
+  "category": "missingness",
+  "title": "is_starter conflates \"no depth-chart row\" with \"not a starter\", asserting 0.0 for 3,980 rows including 146 QB starts",
+  "file": "scripts/build_player_week.py",
+  "line": 272,
+  "failure": "depth_rank_capped correctly stays NaN when the depth-chart merge misses, but is_starter is derived as (depth_rank_capped == 1).astype(float), and NaN == 1 evaluates False, so every unmatched row is stamped 0.0 -- an affirmative claim that the player was not a starter, indistinguishable from a genuine backup. 3,980 of 63,042 player-games (6.3%) have a null depth_rank; 146 of them are quarterbacks who threw 20 or more passes, i.e. unambiguous starters. is_starter is in models/registry_m1.json feature_columns, so a tree learns those 146 QB starts as backup rows. This is the same shape as the missingness leak the project already fixed for the red-zone counts (build_player_week.py:237-244), applied in the opposite direction.",
+  "fix": "df[\"is_starter\"] = df[\"depth_rank_capped\"].eq(1).astype(float).where(df[\"depth_rank_capped\"].notna()) so the unknown case stays NaN and a tree routes it as missing rather than as a confident \"not a starter\". Mirror the change in gridlib/predict.py:210, which has the identical expression."
+ },
+ {
+  "severity": "medium",
+  "category": "doc-drift",
+  "title": "build_prob_calibration docstring says the ratios are fitted on 2023 alone; FIT_SEASONS is four seasons",
+  "file": "scripts/build_prob_calibration.py",
+  "line": 28,
+  "failure": "The \"FIT AND CHECK ARE DIFFERENT SEASONS\" section says \"Ratios are fitted on 2023 (train <= 2022) and the calibration is CHECKED on 2024 (train <= 2023)\". The code fits on 2020, 2021, 2022 and 2023 pooled, and the checker trains through 2022, not 2023. Someone reasoning about whether the check is out of sample gets both halves of the protocol wrong; the FIT_SEASONS comment thirty lines below even calls it \"FOUR fit seasons\", contradicting the docstring in the same file.",
+  "fix": "Rewrite the section to say the ratios are fitted on 2020-2023, each season scored walk-forward, and checked on 2024 by a model trained through 2022."
+ },
+ {
+  "severity": "medium",
+  "category": "doc-drift",
+  "title": "build_team_week docstring's league pass rate and PROE series contradict the table the same script writes",
+  "file": "scripts/build_team_week.py",
+  "line": 29,
+  "failure": "The docstring justifies storing raw PROE with \"the actual league pass rate fell from 0.608 to 0.591\" and a per-season PROE series \"2016 +0.18  2018 +0.02  2020 -0.16  2022 -2.00  2024 -1.72  2025 -1.67\". Every one of those numbers disagrees with league_season_2016_2025_v1.parquet, which this script produces: the pass rate runs 0.6131 to 0.5943 and league PROE is negative in every season, offset from the docstring by roughly +0.5. Anyone using the quoted series to decide how to centre PROE would centre on the wrong offsets, and would conclude 2016-2018 were pass-over-expected when they were not.",
+  "fix": "Replace lines 29-33 with the values from the artifact (they match docs/backfill.md already)."
+ },
+ {
+  "severity": "medium",
+  "category": "resume-logic",
+  "title": "build_weather marks a venue-season complete after any single fetched game, so in-season venues never get weather for their later games",
+  "file": "scripts/build_weather.py",
+  "line": 122,
+  "failure": "The resume set is keyed on (stadium_id, season) and is populated from any previously written row for that venue-season, while the archive request is capped at `cutoff` = yesterday (line 134, 143). During a live season the first run fetches only the hours up to yesterday, writes rows for the games already played, and every later game at that venue silently gets no row (line 154-157: `if k not in wx.index: continue`). On the next run that venue-season is in done_pairs and is skipped entirely, so the missing games are never filled. Concretely: run on 2026-10-01, DEN00/2026 fetches 2026-09-12 to 2026-09-30, writes weeks 2 and 3, and Denver's weeks 6, 8, 11, 13, 16 and 18 home games are permanently absent from weather_2016_2026_v1.parquet no matter how many times the script is re-run. There is also no forecast path at all: FORECAST is defined at line 53 and never referenced, so an unplayed game can never receive weather, contradicting the claim in gridlib/columns.py:126-129 that serving values are forecast weather.",
+  "fix": "Key done_pairs on game_id, not (stadium_id, season), so only games that actually got a row are skipped; and route games whose kickoff is beyond the archive cutoff to the FORECAST endpoint that is already declared."
+ },
+ {
+  "severity": "medium",
+  "category": "tautology",
+  "title": "test_depth_rank_is_capped_identically_on_both_sides imports no project code - it tests pandas.Series.clip",
+  "file": "tests/test_leakage.py",
+  "line": 399,
+  "failure": "The test builds a literal Series, applies `.clip(upper=3)` itself, and asserts the result. It never references gridlib.predict (which caps at predict.py:208) or scripts/build_player_week.py (the training side), so it checks neither of the two sides it claims to compare. If the backfill capped at 3 and inference capped at 6, this test would still pass; the distribution shift it exists to catch is invisible to it.",
+  "fix": "Import the cap from one place and assert both sides use it: read the constant used by build_player_week.py and by predict.build_inference_rows and assert they are equal, then assert both produce the same capped value for a raw rank of 14."
+ },
+ {
+  "severity": "medium",
+  "category": "tautology",
+  "title": "test_rolling_windows_must_count_games_not_weeks asserts a property of the data, not of any code",
+  "file": "tests/test_leakage.py",
+  "line": 158,
+  "failure": "The assertion is that some player's week span exceeds his game count, i.e. that byes exist in ten seasons of NFL data. It is true of the fixture regardless of what gridlib/features.py does, and its own docstring concedes it (\"This test documents the gap exists\"). _prior_roll_mean already counts rows rather than weeks; nothing verifies that, and this test would not notice if it changed to a time-based window.",
+  "fix": "Turn it into a behavioural test: build a synthetic player with weeks 1,2,3,5 (a bye at week 4) and assert _prior_roll_mean(window=3) at week 5 averages weeks 2,3 and... i.e. the three most recent PLAYED rows, not the last three week numbers."
+ },
+ {
+  "severity": "medium",
+  "category": "name-body-mismatch",
+  "title": "test_conditional_and_expected_are_separate_columns never checks that the two columns exist or that the board uses the conditional one",
+  "file": "tests/test_leakage.py",
+  "line": 301,
+  "failure": "The docstring states the p_play/{target}/{target}_expected invariant and ends \"Both must exist, separately\". The body calls attach_p_play on a three-row frame and asserts only that p_play is present, in [0,1], and higher for a starter than a deep reserve. It never touches project_week, where the twin is created (predict.py:421), and no test anywhere asserts that props.compare reads {target} rather than {target}_expected. Grep confirms `_expected` appears in only two non-doc places in the whole repo: predict.py:421 and this docstring. So the estimand invariant named as a key project invariant has no test that could fail if project_week stopped emitting the twin, or if compare started reading it.",
+  "fix": "Add a test over a stubbed project_week output asserting that for every target both {target} and {target}_expected exist, that {target}_expected == {target} * p_play, and that props.compare's output for a known projection equals the conditional column (not the product), e.g. by setting p_play to 0.5 and checking the compared model value does not halve."
+ },
+ {
+  "severity": "medium",
+  "category": "silent-skip",
+  "title": "test_venue_columns_are_not_constant calls pytest.skip inside its loop, so one missing column silently cancels the checks after it",
+  "file": "tests/test_leakage.py",
+  "line": 423,
+  "failure": "The loop iterates (\"roof_indoor\", \"is_turf\", \"altitude_m\", \"rest_diff\", \"is_primetime\", \"week_of_season\") and calls pytest.skip() the first time a column is absent. pytest.skip raises, so the whole test aborts and reports as skipped: if roof_indoor or is_turf were ever dropped from the backfill, altitude_m - the column the block comment says shipped as all zeros because of a dead stadium_id join - would never be checked, and the suite would show a skip rather than a failure. The same pattern would hide any later column in the tuple.",
+  "fix": "Collect missing columns and constant columns into two lists and assert on both after the loop, or parametrize over the column names so each one skips or fails independently."
+ },
+ {
+  "severity": "medium",
+  "category": "test-coverage",
+  "title": "The network-isolation test only inspects direct imports, and props.py already reaches the network through fetch_kickoffs",
+  "file": "tests/test_props.py",
+  "line": 342,
+  "failure": "test_props_module_cannot_reach_the_network walks props.py's AST and asserts none of {requests, urllib, urllib3, httpx, aiohttp, socket} is imported. It never follows a relative import. props.py:784-786 defines fetch_kickoffs, which does `from .fetch import kickoff_series`, and gridlib/fetch.py:42 imports requests and does HTTP GETs at line 89. route_to_weeks calls fetch_kickoffs on every paste (props.py:757), so importing and using props does pull the network stack into the process - verified. The test's assertion is also trivially bypassable in the direction it exists to prevent: a props.py containing `from .fetch import _http_parquet` plus a function that calls it on https://api.prizepicks.com/projections passes unchanged, because the only name recorded is \"fetch\".",
+  "fix": "Assert on the string that actually matters instead of (or as well as) the import set: walk the AST for any Str/Constant containing \"prizepicks\" outside a docstring, and resolve relative imports transitively before the network-library check."
+ },
+ {
+  "severity": "medium",
+  "category": "tautology",
+  "title": "test_shrink_cannot_cross_a_coin_flip re-implements the shrink inside the test; production prob_over is never called",
+  "file": "tests/test_props.py",
+  "line": 973,
+  "failure": "The body computes `shrunk = 0.5 + (raw - 0.5) * (1.0 - U.SHRINK)` itself and asserts the sign is preserved. That is algebraically true for any SHRINK in [0, 1), so the test only pins the value of a constant; it says nothing about gridlib/uncertainty.py:186, which is where the shrink is actually applied inside prob_over. If the applied form were changed (a different centre, or applied before the interp instead of after) the test would still pass. The companion test_shrink_is_actually_applied (line 985) does call prob_over, but only checks an upper bound, so it cannot see a sign flip near 0.5 either.",
+  "fix": "Assert the property on the real function: for a target with a fitted distribution, sweep lines around the median and check that sign(prob_over - 0.5) matches sign(median_projection - line) at every point, which is the invariant the shrink must not break."
+ },
+ {
+  "severity": "low",
+  "category": "ci-lifecycle",
+  "title": "Scheduled weekly refresh will be auto-disabled over the offseason before it ever reaches week 1",
+  "file": ".github/workflows/weekly.yml",
+  "line": 27,
+  "failure": "The only trigger for the refresh is `cron: \"0 13 * * 2\"` on a public repository. GitHub disables scheduled workflows in public repos after 60 days with no repository activity, and this job's own steps produce no commit in the offseason: from the last February commit through late August every Tuesday run takes the `no change this week` branch (weekly.yml:103), so nothing pushes and the 60-day clock is never reset by the job itself. The workflow is then disabled and the first in-season Tuesday silently does not run \u2014 no failure notification, no commit \u2014 and the site serves the frozen 2016-2025 history all season (the exact staleness described in weekly.yml's own header). `workflow_dispatch` exists but requires someone to remember.",
+  "fix": "Either keep the repo active over the offseason (the committed weekly board pastes already do this in season, but not Feb-Aug), or add a cheap keepalive step, or accept it and add a preseason checklist item to re-enable the workflow in the Actions tab."
+ },
+ {
+  "severity": "low",
+  "category": "leakage",
+  "title": "Positional-defence league prior falls back to a full-panel mean that includes the current and future seasons",
+  "file": "/Users/barrettcollins/Desktop/Claude/NFL Predict/gridlib/features.py",
+  "line": 713,
+  "failure": "`add_positional_defense` builds its league prior correctly as an expanding mean over STRICTLY prior seasons (features.py:706-709), then fills the resulting NaN with `allowed.groupby(\"position\")[s].transform(\"mean\")` \u2014 the mean over every row in the frame, including the row's own season, every later season, and (at serve time) the zero-valued rows constructed for the upcoming game. Measured on the shipped backfill this fires on 2,701 of 27,538 defence-game-position rows (9.8%), all of them season 2016, and it feeds the empirical-Bayes prior for f_dvp_targets / f_dvp_receiving_yards / f_dvp_carries / f_dvp_rushing_yards on every 2016 row. The contaminating quantity is a per-position constant (WR 19.345, TE 7.070, RB 6.168 targets allowed per defence-game), so it cannot leak any single row's outcome, but it does embed 2017-2025 league levels into 2016 features and it violates the module's own stated rule. It is the same shape as the two leaks the file documents, just smaller.",
+  "fix": "Fall back to a within-season-so-far prior computed with the same cumsum-minus-current discipline used everywhere else in the module, or leave the first season's f_dvp_* as NaN and let the tree route it \u2014 either is point-in-time honest. Cheapest correct option: restrict the fallback mean to `allowed[allowed[\"season\"] < row season]` and accept NaN when there is nothing earlier."
+ },
+ {
+  "severity": "low",
+  "category": "doc-drift",
+  "title": "README's gridlib layout lists a module that does not exist and omits three that do",
+  "file": "README.md",
+  "line": 55,
+  "failure": "\"gridlib/  cache, fetch, features, columns, model, predict, props, store, theme\". There is no gridlib/model.py, and teams.py, uncertainty.py and util.py are missing \u2014 uncertainty.py in particular is the module that decides every lean on the board.",
+  "fix": "Replace \"model\" with \"uncertainty\" and add teams/util."
+ },
+ {
+  "severity": "low",
+  "category": "doc-drift",
+  "title": "README headline claim that every number is a distribution mean is contradicted by the median board",
+  "file": "README.md",
+  "line": 6,
+  "failure": "The bolded second paragraph, \"**Every number is the mean of a modelled distribution, not a forecast of what will happen**\", is the README's framing sentence. The number shown beside every prop line is the median, for the eight targets with a fitted distribution. About.py:42 makes the same claim on the live site.",
+  "fix": "Say the models estimate means and the prop comparison displays the median of that distribution, so MODEL > LINE and the lean always agree."
+ },
+ {
+  "severity": "low",
+  "category": "doc-drift",
+  "title": "backfill.md says the column contract has five buckets; classify() returns six",
+  "file": "docs/backfill.md",
+  "line": 131,
+  "failure": "\"`gridlib/columns.py` classifies **every** column into one of five buckets\" \u2014 the table immediately below it lists six (key, target, same_game_exposure, same_game_team, pregame, postgame_trap), and classify() returns six distinct strings. The audit over the built table populates all six.",
+  "fix": "Change \"five\" to \"six\"."
+ },
+ {
+  "severity": "low",
+  "category": "doc-drift",
+  "title": "backfill.md carries weather forward as an open unusable field; the block was built, classified pregame and rejected",
+  "file": "docs/backfill.md",
+  "line": 182,
+  "failure": "Under \"Known gaps, carried forward\": \"**Weather is unusable as a feature.** `temp` and `wind` are written only after a game is played. Classified as `postgame_trap`. Still an open decision.\" Six wx_* columns are now in columns.PREGAME, are built by scripts/build_weather.py into a committed artifact, and were measured and rejected with a written verdict. A reader thinks weather is untouched work.",
+  "fix": "Move the item to a resolved section pointing at the features.py verdict; keep only the `temp`/`wind` postgame-trap note as a live gap."
+ },
+ {
+  "severity": "low",
+  "category": "doc-drift",
+  "title": "model_report.md points at a CSV for \"full numbers\" that contains no test-fold rows",
+  "file": "docs/model_report.md",
+  "line": 76,
+  "failure": "The headline results table is labelled \"Test season 2024 (the honest number)\" and is followed by \"Full numbers in `docs/model_report_data.csv`\". That file has 16 rows, all with fold=validation. None of the test-season figures quoted in the report can be found in it, so a reader trying to verify the +13.2% passing-yards test result against the data file finds a different number (+11.4% on validation) and no way to reconcile.",
+  "fix": "Either re-run validate_models.py --test and append those rows, or say the CSV holds the validation fold and the test numbers are stamped in models/registry_m1.json."
+ },
+ {
+  "severity": "low",
+  "category": "doc-drift",
+  "title": "columns.py documents a SAME_GAME_OUTCOME bucket that classify() never returns",
+  "file": "gridlib/columns.py",
+  "line": 26,
+  "failure": "The module docstring's \"THE BUCKETS\" section names five buckets, one of them SAME_GAME_OUTCOME, described as \"the big, dangerous bucket\". classify() returns \"same_game_team\" and \"same_game_exposure\" instead and never emits SAME_GAME_OUTCOME. A caller writing `if classify(c) == \"same_game_outcome\"` from the docstring gets a branch that is never taken; the docstring also omits the exposure bucket entirely.",
+  "fix": "Replace the SAME_GAME_OUTCOME entry with SAME_GAME_TEAM and SAME_GAME_EXPOSURE, matching the strings classify() returns."
+ },
+ {
+  "severity": "low",
+  "category": "train-serve-skew",
+  "title": "Depth-chart FB label vs backfill RB label: the same player trains as a receiver and is served with FB-scale defence-vs-position",
+  "file": "gridlib/predict.py",
+  "line": 124,
+  "failure": "build_inference_rows takes position from the depth chart via _POS_MAP, while the training table takes it from the weekly-stats feed. For six of the 490 players in the 2026 week-1 board that already have history the two disagree, five of them RB in the backfill and FB on the chart. Two consequences. (1) The receiving models are registered for ['WR','TE','RB'], so `applies` at line 404 masks them out and targets/receptions/receiving_yards come back NaN for a player every one of whose training rows was an RB row with real targets; any posted receiving prop for him is then dropped at props.py without being counted as refused or unmatched. (2) features.add_positional_defense joins f_dvp_* on position, so at serve he gets the FB-allowed cells while every training row he contributed carried the RB-allowed cells, which are two orders of magnitude apart.",
+  "fix": "Resolve position from the player's own backfill history when it exists and fall back to the depth-chart label only for players with no history, or map FB to RB on both sides so the training label and the serving label are the same string for the same player."
+ },
+ {
+  "severity": "low",
+  "category": "silent-degradation",
+  "title": "fantasy_score returns 0.0 for a row with no projected components, and compare()'s fantasy branch is the only one with no NaN guard",
+  "file": "gridlib/predict.py",
+  "line": 450,
+  "failure": "fantasy_score starts at 0.0 and skips every NaN component, so a row where every PP_SCORING column is NaN returns exactly 0.0 - indistinguishable from a genuine zero projection. All 32 kicker rows in cache/predictions_2026_w01_m1.parquet score 0.00. compare()'s fantasy branch (props.py:902-903) consumes that value with no `pd.isna` check, unlike the mean branch at 906-909 which explicitly drops NaN rows. A Fantasy Score line on any such player is priced at 0.0 and rendered as a large, confident Less. Currently latent for kickers only because the saved board's 130 fantasy lines are WR 68 / RB 26 / TE 20 / QB 16, but the same path fires for every position the moment a model artifact goes missing (see predict.py:382-383).",
+  "fix": "Return NaN from fantasy_score when no scoring component is present (track a `seen` flag), and add the same `pd.isna(model_val): continue` guard to the fantasy branch in compare()."
+ },
+ {
+  "severity": "low",
+  "category": "silent-degradation",
+  "title": "{target}_source is stamped \"model\" before the artifact-existence check, so a missing .joblib produces a NaN target labelled as a model projection",
+  "file": "gridlib/predict.py",
+  "line": 383,
+  "failure": "`live[f\"{target}_source\"] = meta[\"present_as\"]` runs at line 369, before the `if not path.exists()` check at 381. If a model artifact is deleted or fails to deploy, the target becomes NaN while its _source column still reads \"model\", and the only signal is a logger.warning at default level WARNING going to stderr. Mean props for that stat are then silently dropped by props.compare (adding to the 77 uncounted lines), and every affected player's Fantasy Score silently loses that stat's entire contribution - e.g. deleting passing_yards_m1.joblib drops every QB fantasy composite by roughly 10 points with the row still badged \"composed\" and no \"baseline\" or \"low conf\" marker in the ledger.",
+  "fix": "Move the artifact check ahead of the source stamp and set the source to something like \"unavailable\", or raise - a missing artifact for a shipped target is a deployment error, not a degradation to absorb."
+ },
+ {
+  "severity": "low",
+  "category": "silent-degradation",
+  "title": "p_play falls back to a hardcoded 0.5 for any (position, rank) cell the availability grid does not contain",
+  "file": "gridlib/predict.py",
+  "line": 113,
+  "failure": "attach_p_play caps rank at MAX_RANK=6 and fills a missing rank with 6, then looks the cell up with a 0.5 default. cache/availability_2025_2025_v1.parquet only contains FB ranks 1-3, K ranks 1-3 and QB ranks 1-5, so an FB listed 4th, a 4th kicker, a QB at rank 6+, or any skill player whose pos_rank is missing gets p_play = 0.5 - a number never measured, higher than the measured STARTING fullback (0.447) and nearly double a measured QB2 (0.267). No warning is logged for the per-cell miss (only for a wholly missing grid, line 102-107), so the value is indistinguishable from a fitted one, and it flows straight into {target}_expected and the scripts/validate_coherence.py hard gates. Currently unreached (0 of 609 rows in the 2026 week 1 projections hit it, because week 1 charts top out at FB3/PK3/QB5), but the 2025+ depth-chart schema runs to rank 14 and RB/TE/WR already exceed 6.",
+  "fix": "Fall back to the position's overall rate (already computed as `pos_rate` in build_availability.py and worth persisting in the artifact) rather than 0.5, and log or count every cell miss so a coverage gap is visible instead of neutral."
+ },
+ {
+  "severity": "low",
+  "category": "doc-drift",
+  "title": "predict.py repeats the stale \"three targets\" count for the level correction",
+  "file": "gridlib/predict.py",
+  "line": 396,
+  "failure": "The comment beside the apply_level call says \"Measured LEVEL correction, for the three targets where one survived the two-stage gate.\" Four targets are corrected at serve time, receptions included, so a reader tracing why a receptions projection moved will not find it in the documented set.",
+  "fix": "Change \"three targets\" to \"four targets\"."
+ },
+ {
+  "severity": "low",
+  "category": "robustness",
+  "title": "parse_prizepicks_json raises an uncaught AttributeError when data[] or included[] holds a non-dict",
+  "file": "gridlib/props.py",
+  "line": 231,
+  "failure": "The loops call p.get(\"type\") (line 231) and inc.get(\"type\") (line 220) without checking that the element is a mapping. A payload that is valid JSON but whose data[] or included[] contains a string or number raises AttributeError: 'str' object has no attribute 'get'. parse_any's handler at line 349 catches only (json.JSONDecodeError, TypeError, ValueError), so AttributeError escapes parse_any, escapes resolve_and_persist, and reaches Streamlit as a red traceback on app.py:102 - before any page content renders. Everything else in this parser is defensive about shape (isinstance checks on raw, `or {}` on attributes/relationships, _person_like on names), so this is the one hole.",
+  "fix": "Add `if not isinstance(p, dict): continue` / `if not isinstance(inc, dict): continue` at the top of both loops, and add AttributeError to parse_any's except tuple as a backstop."
+ },
+ {
+  "severity": "low",
+  "category": "certainty-claim",
+  "title": "Touchdown probabilities bypass the FLOOR/CEIL rule and render as \"0%\" on the board",
+  "file": "gridlib/props.py",
+  "line": 790,
+  "failure": "uncertainty.py:31-34 states \"Never return certainty. A model that says 0% is claiming an outcome is impossible\" and clamps prob_over to [0.01, 0.99]. poisson_at_least has no such clamp - it clamps only to [0.0, 1.0] at props.py:810 - and its output is what props_ui._fmt_model prints for kind==\"probability\" as f\"{100*model:.0f}%\". On the committed frozen 2026 week-1 board 2 of 321 probability rows round to exactly 0 (George Holani, Player Touchdowns 1.5; Jordan Love, Pass+Rush+Rec TDs 1.5) and render as \"0%\", and 6 render as 1% or less. The board therefore prints the impossibility claim the sibling module exists to forbid.",
+  "fix": "Apply the same FLOOR/CEIL clamp to poisson_at_least's return value, or clamp in compare() where model_val is set for the probability branch."
+ },
+ {
+  "severity": "low",
+  "category": "quadratic-scan",
+  "title": "route_to_weeks rescans and re-tz-converts the whole season schedule once per pasted line",
+  "file": "gridlib/props.py",
+  "line": 768,
+  "failure": "For every row of a pasted board, route_to_weeks recomputes `(reg[\"kickoff\"].dt.tz_convert(\"UTC\") - ts).abs()` over the full regular-season games frame (272 rows) and then calls `.mode()` on the match. That is O(lines x games): 1,325 x 272 = ~360,000 datetime subtractions plus 1,325 mode() calls per paste. Measured at 0.31 s for the committed 1,325-line board (0.24 ms per line). This runs inside resolve_and_persist, which is called at the top of both app.py and pages/Game.py on every rerun where pp_paste is non-empty.",
+  "fix": "Convert the kickoff column to UTC once outside the loop, then resolve all lines at once with a merge_asof or a numpy searchsorted against the sorted kickoff array with a 6-hour tolerance."
+ },
+ {
+  "severity": "low",
+  "category": "dead-code",
+  "title": "\"anytime td\" is in both STAT_MAP and REFUSE; REFUSE wins, so the probability-routing comment is false for that key",
+  "file": "gridlib/props.py",
+  "line": 137,
+  "failure": "The comment at lines 122-136 says anytime-touchdown props are \"Routed to a PROBABILITY, never to a mean, and this is a correctness fix rather than a preference\", and STAT_MAP:137 maps \"anytime td\" to the __prob__ path. _resolve_stat checks REFUSE first, and REFUSE:164 contains \"anytime td\", so any board posting that stat_type is refused with \"a probability, not a mean; needs a scoring model\" and counted under meta[\"refused\"] \u2014 the STAT_MAP entry is unreachable. The reason string is also wrong: a scoring model exists (poisson_at_least on rushing_tds + receiving_tds). The 2026 week 1 board happens to label these \"Player Touchdowns\", which is mapped, so nothing is lost today; a board using the other label silently drops all of them.",
+  "fix": "Delete \"anytime td\" from REFUSE so the STAT_MAP entry takes effect, or delete it from STAT_MAP and stop claiming it is routed to a probability."
+ },
+ {
+  "severity": "low",
+  "category": "under-labelled-stat",
+  "title": "Fantasy Score rows carry a neutral \"unmeasured\" badge and rank in the same band as \"weak\", above every \"no edge\" row, despite being composed mostly of the two models that failed the ship gate",
+  "file": "gridlib/props.py",
+  "line": 517,
+  "failure": "reliability_for(()) returns tier \"unmeasured\" for the fantasy composite (verified by call), so _tier_badge renders the label \"unmeasured\" with the tooltip \"Side-picking accuracy not measured for this stat\", which reads as neutral. rank_by_reliability maps unknown tiers to TIER_ORDER.get(t, 2) -- the same rank as \"weak\" -- so Fantasy Score sorts above all 382 \"no edge\" rows. props_ui.py:329 defines weak_tiers = {\"negative\", \"none\"}, so the \"N of these are stats where a lean is not evidence\" notice never names Fantasy Score. But predict.fantasy_score (predict.py:436-448) documents that the composite \"inherits the touchdown problem: two of the three touchdown terms are served from a baseline rather than a model, and they carry the largest per-unit weight in the whole formula\" (6.0 points each), and its own docstring says no uncertainty band can be honest for it because the components are correlated. It also gets no median correction and no P(Over): cols == (\"__fantasy__\",) is excluded at props.py:931, so the lean comes from the mean-minus-line gap, the exact rule the site abandoned for skewed stats. On the live week-1 board this is 130 of 1022 rows -- 13% of the board and the second-largest stat.",
+  "fix": "Give the fantasy composite its own tier that inherits the worst of its components (so it lands in \"no edge\" and in the \"lean is not evidence\" notice), and make TIER_ORDER default place \"unmeasured\" last rather than mid-table."
+ },
+ {
+  "severity": "low",
+  "category": "html-injection",
+  "title": "Injury status interpolated unescaped into a quoted class attribute",
+  "file": "gridlib/store.py",
+  "line": 389,
+  "failure": "`status` comes from the nflverse injuries feed (`report_status`, joined in pages/Game.py:154-157) and is interpolated raw into `class=\"gv-inj gv-inj-{status.lower()}\"`. The visible text right beside it is escaped, so the omission is clearly unintentional. A feed value containing a double quote - e.g. `Out\"><img src=x onerror=...>` from a corrupted or poisoned upstream file - closes the class attribute and injects markup into the depth chart, which renders through st.markdown(unsafe_allow_html=True) at pages/Game.py:159-163. This is the single interpolation in store.py that breaks the file's own stated rule at store.py:5-7 (\"every interpolated value passes through util.esc first\").",
+  "fix": "Slugify or escape the class fragment, e.g. `re.sub(r'[^a-z0-9-]', '', status.lower())`, or at minimum `esc(status.lower())`."
+ },
+ {
+  "severity": "low",
+  "category": "doc-drift",
+  "title": "theme.py points the accuracy record at a /Props page that does not exist",
+  "file": "gridlib/theme.py",
+  "line": 44,
+  "failure": "The comment explaining why Accuracy is not in the nav says \"the week-by-week table on /Props carries that role for now.\" There is no Props page: pages/ holds only Game.py and About.py, and props_ui.py:3 says it is \"Deliberately NOT a page.\" The record renders inline on the home page. A maintainer looking for /Props to add the nav entry finds nothing.",
+  "fix": "Change \"/Props\" to \"the week board\"."
+ },
+ {
+  "severity": "low",
+  "category": "stale-contract",
+  "title": "VALIDATED_MAX is dead and its docstring describes a display cap that does not exist",
+  "file": "gridlib/uncertainty.py",
+  "line": 64,
+  "failure": "The constant's 18-line docstring states \"The display caps at this value and says '80%+' rather than printing a precise number the calibration cannot stand behind. Ranking still uses the full precision.\" Grepping the whole repo for VALIDATED_MAX returns only its own definition - nothing imports or reads it. The board no longer prints P(Over) at all (props_ui._fmt_gap, lines 435-450, replaced the percentage with the unit gap), so neither half of the claim is true. A maintainer reading uncertainty.py concludes the surface is protected against over-confident probabilities when nothing enforces it, which is exactly how the uncapped 0% renderings above reached the board.",
+  "fix": "Either wire the cap into wherever a probability is displayed (currently only _fmt_model for touchdown rows), or delete the constant and the paragraph describing behaviour that was removed with the percentage column."
+ },
+ {
+  "severity": "low",
+  "category": "unsupported-claim",
+  "title": "About page says extra points \"lose to a league constant\" and are \"Close to a guess\"; the receipts show pat_att beats all three baselines and ships as a full model",
+  "file": "pages/About.py",
+  "line": 66,
+  "failure": "The About reliability table groups field goals and extra points into one row with the verdict \"beat the player baselines but lose to a league constant / Close to a guess\". docs/model_report.md's own test-season table gives pat_att model MAE 1.076 against the league constant b1 = 1.183, the season-to-date mean b2 = 1.147 and the shrunk rate b3 = 1.135, gate PASS with no asterisk; the report's \"two asterisks\" section names only fg_att as losing to a constant, and fg_made's 1.013 also edges b1's 1.021. models/registry_m1.json agrees: pat_att is present_as \"model\" / gate \"pass\", while fg_att and fg_made are \"model_low_confidence\" / gate \"weak\". data/stat_reliability.csv gives pat_att tier \"weak\" with a completely different note (\"follows team touchdowns, so it inherits the touchdown problem\") and reserves the league-constant note for fg_att and fg_made. So the one row on the page a reader consults to decide how much to trust the number states a fact about extra points that three separate receipts contradict.",
+  "fix": "Split the row: field goals lose to a league constant, extra points pass the gate but inherit the touchdown noise through team TDs."
+ },
+ {
+  "severity": "low",
+  "category": "inconsistency",
+  "title": "Slate card line-count pill promises more lines than the game page shows, contradicting its own comment",
+  "file": "props_ui.py",
+  "line": 132,
+  "failure": "line_counts_by_game applies only filter_pickable, but the game page's render_board also applies filter_informed. A card advertises N lines and the page it links to shows fewer. Measured on 2026 week 1: pills sum to 529 while the game pages show 512; the CLE at JAX card says 44 and the page shows 39, GB at MIN says 45 and shows 41.",
+  "fix": "Add `pickable, _thin = props.filter_informed(pickable)` before counting, or route both through one shared filter helper."
+ },
+ {
+  "severity": "low",
+  "category": "inconsistency",
+  "title": "props_by_name renders thin-history lines under player rows on the same page that says those lines were withheld",
+  "file": "props_ui.py",
+  "line": 151,
+  "failure": "pages/Game.py builds the per-player expandable rows from props_by_name (filter_pickable only) and the ledger below from render_board (filter_pickable + filter_informed). A player with fewer than MIN_GAMES_FOR_EDGE=3 prior games therefore has his prop rendered under his depth-chart row while the ledger a few hundred pixels below prints \"N line(s) withheld for thin history\" naming him. The same page both shows and disclaims the same pick.",
+  "fix": "Apply filter_informed in props_by_name too, or (better) have both call one shared \"showable rows\" helper."
+ },
+ {
+  "severity": "low",
+  "category": "unreconcilable-record",
+  "title": "The week-by-week table shows hit rates for weeks the season record silently excludes, so the two never reconcile and nothing on the page says why",
+  "file": "props_ui.py",
+  "line": 612,
+  "failure": "render_week_record appends a week to the out-of-sample record only when `basis == \"frozen\"` (props_ui.py:603), but every week with saved lines gets a row in the table with a populated \"Graded\" count and \"Model hit %\" (props_ui.py:611-616), including weeks scored on the fly (basis \"recomputed\"). On Streamlit Cloud with GRIDIRONVALUE_READONLY=1, freeze_projections returns 0 (props.py:676-683), so any week a visitor pastes has no snapshot and lands as \"recomputed\": its hit rate is displayed but excluded from the headline. Concrete: a visitor pastes an already-played 2026 week, the table shows \"Graded 180, Model hit % 63.3, In sample: no, Basis: recomputed\", and the headline above says \"115 of 200 (57.5%)\" -- the 180 rows are nowhere in it. The explanatory note underneath (props_ui.py:647-654) explains only the \"in sample\" column and never mentions \"recomputed\" or that recomputed weeks are excluded, so the reader cannot make the two numbers add up and will reasonably read 63.3% as part of the record.",
+  "fix": "Either grey out or omit hit rates for recomputed weeks, or add one sentence to the note saying a recomputed week is scored against today's model and is therefore shown but not counted."
+ },
+ {
+  "severity": "low",
+  "category": "csrf",
+  "title": "render.yaml ships the app with CORS and XSRF protection both disabled",
+  "file": "render.yaml",
+  "line": 18,
+  "failure": "The committed Render start command passes `--server.enableCORS false` and `--server.enableXsrfProtection false`. With both off, Streamlit accepts websocket and POST traffic from any origin with no XSRF token, so a page on any other site can open a session against the app and drive its widgets. Combined with the unguarded `_clear_lines` (finding 2, which on Render is not even nominally read-only since DEPLOY.md:66 says GRIDIRONVALUE_READONLY is left unset there), a cross-origin page can delete the saved boards. DEPLOY.md:62 states render.yaml \"is kept and still correct\", so this is a live configuration, not dead text.",
+  "fix": "Drop `--server.enableXsrfProtection false`. Render's proxy does not require it; only enableCORS false is needed behind their proxy, and Streamlit supports XSRF protection with CORS off."
+ },
+ {
+  "severity": "low",
+  "category": "doc-drift",
+  "title": "scripts/README \"Current scripts\" table documents 10 of the 22 scripts, including none of the calibration or lean work",
+  "file": "scripts/README.md",
+  "line": 13,
+  "failure": "The section is headed \"Current scripts\" and reads as an inventory, but omits train_models.py, build_prob_calibration.py, build_mean_calibration.py, validate_calibration.py, validate_lean_accuracy.py, validate_lean_probability.py, build_weather.py, build_referee.py, build_def_scheme.py, exp_depth_rank.py and exp_feature_blocks.py. Someone rebuilding from this list produces a deploy with no calibration artifacts, which is the same silent gap-rule regression as the DEPLOY.md finding.",
+  "fix": "Regenerate the table from the directory, or state that it covers the core pipeline only and link the rest."
+ },
+ {
+  "severity": "low",
+  "category": "doc-drift",
+  "title": "build_weather says 47 venues means 47 calls; the code requests one range per venue-season",
+  "file": "scripts/build_weather.py",
+  "line": 19,
+  "failure": "The section headed \"ONE CALL PER VENUE, NOT PER GAME\" says \"a decade of hourly weather for one stadium is a single request ... 47 venues, 47 calls.\" main() iterates venue-season pairs, so a 2016-2026 run is on the order of 300+ calls with a 1.5s sleep between them. The _hourly docstring 40 lines later documents the opposite approach and why the whole-decade version was abandoned. A reader estimating runtime or rate-limit risk from the header is wrong by an order of magnitude.",
+  "fix": "Retitle the section \"one call per venue-season\" and drop the 47-calls figure."
+ },
+ {
+  "severity": "low",
+  "category": "doc-drift",
+  "title": "exp_feature_blocks docstring's rejected/shipped lists predate half the programme it now runs",
+  "file": "scripts/exp_feature_blocks.py",
+  "line": 16,
+  "failure": "\"Already rejected on this project: recency weighting, per-position models, extra capacity, longer rolling windows, and the red-zone block. Shipped: depth rank, partially.\" The BLOCKS dict thirty lines below runs eleven arms, of which bio and positional-defence subsequently shipped (USE_BIO = True, USE_POSITIONAL_DEF = True) and marcel, ngs, venue, scheme, refcrew, pfradv, weather and rolechg were all rejected with written verdicts. A reader is told the base rate from an early round and cannot tell which arms are already answered.",
+  "fix": "Point the reader at the flag comments in gridlib/features.py rather than restating a snapshot here."
+ },
+ {
+  "severity": "low",
+  "category": "doc-drift",
+  "title": "train_models docstring names the registry file registry.json; it writes registry_m1.json",
+  "file": "scripts/train_models.py",
+  "line": 5,
+  "failure": "\"writes one joblib per target to `models/`, plus a `registry.json` carrying the validation verdict for each target.\" The file is version-stamped registry_m1.json, and predict.load_registry looks for f\"registry_{VERSION}.json\". Grepping for registry.json after a failed load finds nothing.",
+  "fix": "Write `registry_m1.json` (or `registry_<VERSION>.json`) in the docstring."
+ },
+ {
+  "severity": "low",
+  "category": "validation-gap",
+  "title": "validate_backfill's join checks are satisfied by every row the two team-code bugs corrupt, so both shipped undetected",
+  "file": "scripts/validate_backfill.py",
+  "line": 85,
+  "failure": "The only join assertions are `pw[\"off_plays\"].isna().sum() == 0` and `pw[\"gameday\"].isna().sum() == 0`. Both merges DID succeed for the 477 mis-oriented rows and the 977 depth-chart-orphaned rows -- team_week joins on game_id+team (pbp codes match stats codes) and the schedule joins on game_id -- so both checks report PASS on a table whose team_spread has the wrong sign and whose is_starter is wrong for two whole franchises. Nothing anywhere asserts a row count before and after a merge, nothing passes validate= to any of the fourteen merges in build_player_week.py, nothing checks depth_rank coverage (the Coverage section at line 209-217 reports off_snaps and routes_run_proxy only), and nothing checks that the derived market/rest orientation agrees with the is_home flag the same table already carries.",
+  "fix": "Add three hard checks: (a) no (season, team) cell has 0% depth_rank coverage; (b) (pw.team == pw.home_team) equals pw.is_home for every row; (c) each merge in build_player_week asserts len(df) is unchanged, or passes validate=\"m:1\" / \"m:m\"-free equivalents so a many-to-many raises instead of silently multiplying rows."
+ },
+ {
+  "severity": "low",
+  "category": "doc-drift",
+  "title": "validate_calibration docstring repeats the single-season fit claim",
+  "file": "scripts/validate_calibration.py",
+  "line": 9,
+  "failure": "\"Fitted on 2023, scored on 2024, which the calibration never saw.\" The artifact under test was fitted on 2020-2023. The out-of-sample claim still holds for 2024, but a reader checking whether 2022 rows influenced the artifact is told they did not.",
+  "fix": "Say \"fitted on 2020-2023, scored on 2024\"."
+ },
+ {
+  "severity": "low",
+  "category": "conditional-assertion",
+  "title": "test_lean_follows_the_probability_not_the_gap puts its only assertion behind a condition on the value it is testing",
+  "file": "tests/test_props.py",
+  "line": 898,
+  "failure": "The test sets receiving_yards to 60.0 against a 58.5 line, then does `if row[\"p_over\"] < 0.5:` before asserting lean == \"Less\". If the calibration artifact is ever rebuilt such that p_over comes out >= 0.5 for this row, the test asserts nothing at all - not even that the lean is then \"More\" - and reports as a pass. It currently exercises the branch (measured p_over = 0.4552, model 53.86 vs line 58.5), so it is live today, but it is one recalibration away from being a silent no-op, and the calibration parquet is a committed artifact that is expected to be rebuilt.",
+  "fix": "Drop the conditional and assert the biconditional that actually holds: (row[\"p_over\"] > 0.5) == (row[\"lean\"] == \"More\") and (row[\"model\"] > row[\"line\"]) == (row[\"lean\"] == \"More\"). That is true regardless of which side the recalibrated probability lands on."
+ },
+ {
+  "severity": "low",
+  "category": "assertion-on-fixture",
+  "title": "test_odds_type_survives_into_the_per_player_payload builds an unused frame and asserts on a hand-written dict",
+  "file": "tests/test_props.py",
+  "line": 450,
+  "failure": "The test constructs a `table` DataFrame carrying odds_type, then never uses it: it calls props_ui.render_player_lines with a separately hand-written list of dicts that already contains \"odds_type\": \"demon\", and asserts the badge appears. It therefore verifies _odds_badge (already covered at test_props.py:381) and proves nothing about odds_type surviving from compare() into the per-player payload, which is what its name claims and what props_ui.props_by_name (props_ui.py:138, untested) actually does.",
+  "fix": "Drive the payload from real output: run props.compare on lines carrying odds_type \"demon\", pass the resulting row through props_ui.props_by_name, and assert the dict handed to render_player_lines still carries odds_type before rendering it."
+ }
+]
