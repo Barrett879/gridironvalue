@@ -28,6 +28,13 @@ cache/*
 !cache/prob_calibration_v1.parquet
 !cache/mean_calibration_v1.parquet
 
+# The CURRENT season, rebuilt and committed weekly by .github/workflows/weekly.yml.
+# Without it the deployed site projects mid-season as if the season had not
+# started, because the ten-year backfill above is frozen and ends in 2025.
+# Wildcarded by year so next season needs no edit here.
+!cache/player_week_20[2-9][0-9]_20[2-9][0-9]_v1.parquet
+!cache/team_week_20[2-9][0-9]_20[2-9][0-9]_v1.parquet
+
 # Pasted boards and their FROZEN projections are COMMITTED, because the
 # published site has no persistent disk and the accuracy record must not be
 # per-deployment state. Anything written at runtime there dies on the next

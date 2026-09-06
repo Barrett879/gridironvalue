@@ -66,6 +66,11 @@ from .cache import atomic_to_parquet, dc_path, logger, read_parquet_or_none
 MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
 VERSION = "m1"
 BACKFILL = "player_week_2016_2025_v1.parquet"
+# The current season, rebuilt weekly by CI. DATA version v1, not the model
+# version m1: `VERSION` here is the model stamp and using it would have looked
+# for player_week_2026_2026_m1.parquet, which nothing writes, so the file would
+# never be found and the staleness this fixes would have persisted silently.
+CURRENT_TMPL = "player_week_{s}_{s}_v1.parquet"
 LEAGUE = "league_season_2016_2025_v1.parquet"
 
 # Fit on the 2025+ depth-chart schema, which is the one the site serves. The
@@ -304,6 +309,24 @@ def project_week(season: int, week: int,
     if hist is None or lg is None:
         logger.warning("backfill missing; cannot project")
         return pd.DataFrame()
+
+    # THE CURRENT SEASON, appended to the frozen history.
+    #
+    # Without this the site projects mid-season as if the season had not
+    # started. `BACKFILL` is a fixed ten-year file that ends in 2025, so in week
+    # 5 of 2026 a player's own weeks 1 to 4 would be invisible to his features:
+    # every season-to-date value empty, every rolling window reaching back into
+    # last year, and `f_games_prior_season` zero for the entire league. The
+    # projections would degrade a little more every week and nothing would fail.
+    #
+    # The current season lives in its own file so the ten years of history are
+    # never rewritten by an automated job, and so the weekly rebuild is one
+    # season rather than ten. `.github/workflows/weekly.yml` regenerates and
+    # commits it after each slate; Streamlit Cloud redeploys on the push.
+    cur = read_parquet_or_none(dc_path(CURRENT_TMPL.format(s=season)))
+    if cur is not None and not cur.empty:
+        hist = pd.concat([hist, cur], ignore_index=True, sort=False)
+        logger.info("appended %d current-season rows to history", len(cur))
 
     inf = build_inference_rows(season, week, games)
     if inf.empty:

@@ -1,0 +1,107 @@
+# Weekly self-refresh: rebuild THIS season's player-week table and commit it.
+#
+# WHY THIS EXISTS
+# ---------------
+# `cache/player_week_2016_2025_v1.parquet` is a frozen ten-year history. Without
+# a current-season file beside it, the site projects mid-season as if the season
+# had not started: in week 5 a player's own weeks 1 to 4 are invisible to his
+# features, every season-to-date value is empty, rolling windows reach back into
+# last year, and `f_games_prior_season` is zero for the whole league. Nothing
+# errors. The projections just get quietly worse every week.
+#
+# This is the GridironValue equivalent of DiamondValue's daily.yml.
+#
+# WHY ONLY THE CURRENT SEASON
+# ---------------------------
+# Ten years of history should never be rewritten by an unattended job. Rebuilding
+# one season is also minutes rather than an hour, and if a run produces nonsense
+# the blast radius is a single file that can be reverted.
+#
+# TUESDAY, NOT MONDAY: nflverse publishes a slate's stats a few hours after the
+# games, and the NFL week ends with Monday night football. A Tuesday morning run
+# is the first moment a week is actually complete.
+name: weekly-refresh
+
+on:
+  schedule:
+    - cron: "0 13 * * 2"      # Tuesdays 13:00 UTC, ~09:00 ET
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: weekly-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: pip install -r requirements.txt
+
+      - name: Which season
+        id: season
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          from gridlib import fetch
+          # Resolved from the schedule, never from the calendar: the NFL season
+          # spans two calendar years and `get_current_season()` has been wrong
+          # this close to an opener before.
+          print(f"year={fetch.current_season()}")
+          PY
+
+      - name: Rebuild team-week for ${{ steps.season.outputs.year }}
+        run: |
+          python scripts/build_team_week.py \
+            --seasons ${{ steps.season.outputs.year }}-${{ steps.season.outputs.year }}
+
+      - name: Rebuild player-week for ${{ steps.season.outputs.year }}
+        run: |
+          python scripts/build_player_week.py \
+            --seasons ${{ steps.season.outputs.year }}-${{ steps.season.outputs.year }}
+
+      - name: Sanity check before committing
+        run: |
+          python - <<'PY'
+          import sys
+          from gridlib.cache import dc_path, read_parquet_or_none
+          from gridlib.predict import CURRENT_TMPL
+          import gridlib.fetch as fetch
+          season = fetch.current_season()
+          df = read_parquet_or_none(dc_path(CURRENT_TMPL.format(s=season)))
+          if df is None:
+              # Legitimate before week 1 has been played. Not a failure.
+              print("no current-season table yet; nothing to commit")
+              sys.exit(0)
+          # A file that exists but lost its columns would poison every
+          # projection, so refuse to commit one that does not match the history.
+          hist = read_parquet_or_none(dc_path("player_week_2016_2025_v1.parquet"))
+          missing = set(hist.columns) - set(df.columns)
+          if missing:
+              sys.exit(f"current-season table is missing {len(missing)} columns "
+                       f"the history has, e.g. {sorted(missing)[:5]}")
+          print(f"ok: {len(df)} rows, {len(df.columns)} columns, "
+                f"weeks {int(df.week.min())}-{int(df.week.max())}")
+          PY
+
+      - name: Commit if anything changed
+        run: |
+          git config user.name  "gridironvalue-bot"
+          git config user.email "gridironvalue-bot@users.noreply.github.com"
+          git add cache/player_week_*_v1.parquet cache/team_week_*_v1.parquet
+          if git diff --cached --quiet; then
+            echo "no change this week"
+          else
+            git commit -m "Weekly refresh $(date -u '+%Y-%m-%d %H:%M UTC')"
+            git push
+          fi

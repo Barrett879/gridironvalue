@@ -384,7 +384,11 @@ def _ledger_html(table: pd.DataFrame) -> str:
     """The ledger as a plain HTML table, styled by the theme's tokens."""
     rows = []
     for _, r in table.iterrows():
-        cls = "over" if r["diff"] > 0 else "under" if r["diff"] < 0 else ""
+        # From the LEAN, never from the gap. The lean now comes from P(Over),
+        # so colouring by `diff` painted a green "Less" next to a red 52% on
+        # exactly the rows where the two disagree, which is the whole point of
+        # the change.
+        cls = _lean_cls(r.get("lean"))
         badge = ""
         if r["source"] == "baseline":
             badge = '<span class="gv-src base">baseline</span>'
@@ -409,6 +413,12 @@ def _ledger_html(table: pd.DataFrame) -> str:
             '<span class="num">Model</span><span class="num">Line</span>'
             '<span class="num">Chance</span><span class="lean">Lean</span></div>')
     return f'<div class="gv-ledger">{head}{"".join(rows)}</div>'
+
+
+def _lean_cls(lean) -> str:
+    """Colour class for a lean. One source of truth, used by every cell in the
+    row, so a row can never contradict itself."""
+    return "over" if lean == "More" else "under" if lean == "Less" else ""
 
 
 def _fmt_model(r) -> str:
@@ -448,8 +458,11 @@ def _fmt_chance(r) -> str:
         txt = (f"{100 * _u.VALIDATED_MAX:.0f}%+" if conf > _u.VALIDATED_MAX
                else f"{100 * conf:.0f}%")
         return f'<span class="num diff {cls}">{txt}</span>'
-    cls = "over" if r["diff"] > 0 else "under" if r["diff"] < 0 else ""
-    return f'<span class="num diff {cls}">{r["diff"]:+.1f}</span>'
+    # No fitted distribution for this stat, so there is no chance to report.
+    # Showing the gap here read as "CHANCE -0.4", which is not a chance at all.
+    # The tier badge already says the stat is unmeasured; the honest cell is
+    # empty rather than a number in the wrong units.
+    return f'<span class="num diff">{SENTINEL}</span>'
 
 
 def render_player_lines(lines_for_player: list) -> str:
@@ -458,7 +471,7 @@ def render_player_lines(lines_for_player: list) -> str:
         return ""
     rows = []
     for p in lines_for_player:
-        cls = "over" if p["diff"] > 0 else "under" if p["diff"] < 0 else ""
+        cls = _lean_cls(p.get("lean"))
         badge = (' <span class="gv-src base">baseline</span>'
                  if p["source"] == "baseline" else "")
         rows.append(
