@@ -1422,3 +1422,101 @@ def test_feature_columns_excludes_per_target_and_never_leaks():
             assert len(F.feature_columns(feat, keeper)) == len(base), (
                 "an exclusion meant for one target changed another's set"
             )
+
+
+def test_a_moved_line_replaces_the_stale_one_on_re_paste():
+    """The market moves a line and the board has to follow it.
+
+    resolve_and_persist merges as concat([existing, batch]) and
+    collapse_alt_lines sorted on ["_key", "_rank"]. pandas' multi-key sort is
+    STABLE, so between two standard lines for the same player and stat the
+    previously saved row always won, and a line PrizePicks moved from 85.5 to
+    88.5 was discarded on every re-paste. The board then kept comparing the
+    model against a number the market no longer posts, and grading scored the
+    stale line.
+    """
+    from gridlib import props
+
+    existing = pd.DataFrame([{"name": "Josh Allen", "stat_type": "Pass Yards",
+                              "odds_type": "standard", "line": 85.5}])
+    batch = pd.DataFrame([{"name": "Josh Allen", "stat_type": "Pass Yards",
+                           "odds_type": "standard", "line": 88.5}])
+    got = props.collapse_alt_lines(pd.concat([existing, batch],
+                                             ignore_index=True))
+    assert len(got) == 1
+    assert float(got["line"].iloc[0]) == 88.5, (
+        "the stale line won; a re-paste can never update a moved line"
+    )
+
+    # Recency must not override the standard-line preference: an alt ladder is
+    # still collapsed to the standard line even when the alt arrives later.
+    alt = pd.DataFrame([{"name": "Josh Allen", "stat_type": "Pass Yards",
+                         "odds_type": "demon", "line": 120.5}])
+    got2 = props.collapse_alt_lines(pd.concat([existing, alt],
+                                              ignore_index=True))
+    assert len(got2) == 1
+    assert got2["odds_type"].iloc[0] == "standard"
+    assert float(got2["line"].iloc[0]) == 85.5
+
+
+def test_a_moved_line_does_not_disturb_what_is_already_frozen():
+    """FREEZE_KEYS includes `line`, so 85.5 and 88.5 are different picks.
+
+    That is what makes it safe for the newer line to win on the board: the
+    original pick stays frozen as the evidence it is, and the moved line
+    arrives as its own pick with its own first-seen time. If `line` ever leaves
+    the freeze key, letting the newer line win would start rewriting history.
+    """
+    from gridlib import props
+
+    assert "line" in props.FREEZE_KEYS, (
+        "the freeze key no longer includes the line value, so a moved line "
+        "would overwrite the frozen record of the pick actually made"
+    )
+    a = props._freeze_key({"player": "Josh Allen", "stat": "Pass Yards",
+                           "line": 85.5})
+    b = props._freeze_key({"player": "Josh Allen", "stat": "Pass Yards",
+                           "line": 88.5})
+    assert a != b
+
+
+def test_published_edges_match_the_measurement():
+    """The board's tier badges quote a measured number, so it must be the
+    number that was measured.
+
+    data/stat_reliability.csv is hand-maintained and read by every badge and by
+    the board's ordering. docs/lean_probability.csv is what the validator
+    actually produced. They drifted once already: the README published the
+    retired gap-rule edges long after the site moved to the probability rule,
+    inverting the sign on receiving and rushing yards, and the CSV lagged two
+    retrains.
+    """
+    from pathlib import Path
+
+    from gridlib import props
+
+    measured_path = Path(__file__).resolve().parent.parent / "docs" / "lean_probability.csv"
+    if not measured_path.exists():
+        pytest.skip("run scripts/validate_lean_probability.py first")
+    measured = pd.read_csv(measured_path)
+    label_to_stat = {
+        "WR/TE receptions": "receptions", "RB rush attempts": "carries",
+        "QB pass attempts": "attempts", "QB completions": "completions",
+        "Receiving yards": "receiving_yards", "Rushing yards": "rushing_yards",
+        "Passing yards": "passing_yards", "Targets": "targets",
+    }
+    published = props.reliability_table().set_index("stat")["side_edge_pts"]
+
+    drift = []
+    for _, row in measured.iterrows():
+        stat = label_to_stat.get(str(row["prop"]))
+        if stat is None or stat not in published.index:
+            continue
+        want, got = round(float(row["prob_edge"]), 1), float(published[stat])
+        if abs(want - got) > 0.15:
+            drift.append((stat, got, want))
+    assert not drift, (
+        "the published edge disagrees with the measured one "
+        f"(stat, published, measured): {drift}. Re-run "
+        "scripts/validate_lean_probability.py and sync data/stat_reliability.csv"
+    )

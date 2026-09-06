@@ -470,7 +470,26 @@ def test_inference_rows_derive_every_feature_the_backfill_does(table):
     week = fetch.current_week(season) or 1
     inf = predict.build_inference_rows(season, week)
     if inf is None or inf.empty:
-        pytest.skip(f"no depth chart for {season} week {week}")
+        # This used to skip unconditionally, which turned the only train/serve
+        # parity test OFF in exactly the failure mode it guards: a dead
+        # depth-chart feed reported "passed, 1 skipped" and the suite looked
+        # green while nothing could be projected at all.
+        #
+        # A fresh clone with no cached data is a legitimate skip. A missing
+        # CURRENT season while other seasons are present is a broken pipeline,
+        # and this test is the one that should say so.
+        have_any = any(
+            not (fetch.depth_chart_normalized(s) is None
+                 or fetch.depth_chart_normalized(s).empty)
+            for s in (season - 1, season - 2)
+        )
+        assert not have_any, (
+            f"no inference rows for {season} week {week}, but depth charts "
+            "exist for earlier seasons. The feed for the served season is "
+            "broken, which is exactly what this test is for; it is not a "
+            "reason to skip."
+        )
+        pytest.skip("no depth chart for any season; nothing cached to test")
     missing = derived - set(inf.columns)
     assert not missing, (
         f"build_inference_rows does not derive {missing}; the models train on "

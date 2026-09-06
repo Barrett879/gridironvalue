@@ -23,22 +23,42 @@ python -m streamlit run app.py --server.port 8555
 
 ## How much to trust it
 
-Measured out of sample, side-picking edge against a naive line:
+Side-picking edge over always taking the more common side, in percentage points
+of hit rate. Measured out of sample: models trained through 2022, scored on
+2024, using the rule the site actually serves.
 
 | stat | edge | read as |
 |---|---|---|
-| QB pass attempts | +10.1 | the strongest thing this model does |
-| Passing yards | +8.6 | strong |
-| QB completions | +8.1 | strong |
-| WR/TE receptions | +3.1 | moderate |
-| Targets, RB rush attempts | ~0 | no measurable edge |
-| Receiving yards | **-5.7** | **worse than a coin flip** |
-| Rushing yards | **-9.4** | **worse than a coin flip** |
-| Receiving TDs | -0.3 | 86% hit rate, no edge; served as a baseline |
+| QB pass attempts | +11.5 | the strongest thing this model does |
+| Passing yards | +8.4 | strong |
+| QB completions | +7.9 | strong |
+| WR/TE receptions | +5.2 | moderate |
+| Targets | +5.0 | moderate |
+| RB rush attempts | +4.3 | moderate |
+| Receiving yards | +2.9 | slight |
+| Rushing yards | +2.6 | slight |
 
-Yards are volume times efficiency, and the efficiency half is close to noise, so
-a yards projection ends up a noisier estimate of what a season average already
-tells you. The board sorts those to the bottom and says so.
+**These numbers replace an earlier table that had the sign wrong on two props.**
+It reported receiving yards at -5.7 and rushing yards at -9.4, described both as
+worse than a coin flip, and put targets and rush attempts at zero. Those were
+measured under the retired rule that leaned on the gap between the model and the
+line. The site leans on P(Over) now, which is what fixed the yards props: on the
+same rows, receiving yards go -4.8 to +2.9 and rushing yards -7.4 to +2.6. The
+mechanism is that these stats are right-skewed, so the mean sits above the
+median, and a line below the projected mean can still be above the median. The
+gap rule then leaned More on an outcome that was under a coin flip.
+
+**Read these as a ranking, not as a promise about a real board.** The line in
+this measurement is a PROXY: the player's season-to-date mean, because a
+historical archive of actual PrizePicks lines does not exist to test against. A
+real line is set by a market that has already priced most of what the model
+knows, so it is a harder target than the proxy. What the table supports is which
+props this model is better and worse at, not a hit rate you should expect.
+
+The board's own out-of-sample record, on real posted lines, is on the site
+underneath the slate. That one is the honest number, and it is frozen at the
+moment each line was first seen so that retraining the models cannot improve it
+after the fact.
 
 **It also assumes the player plays.** Projections are `E[Y | appeared]`, which is
 the right quantity for a prop (a prop voids on a DNP) and the wrong one to sum

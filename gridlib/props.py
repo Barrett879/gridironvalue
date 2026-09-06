@@ -403,9 +403,26 @@ def collapse_alt_lines(df: pd.DataFrame) -> pd.DataFrame:
     out["_key"] = out["name"].map(normalize_name) + "|" + \
         out["stat_type"].astype(str).str.lower().str.strip()
     out["_rank"] = (out["odds_type"] != "standard").astype(int)
-    out = (out.sort_values(["_key", "_rank"])
+    # Position in the frame, used as recency. The caller merges as
+    # concat([existing, batch]), so a later row is a newer paste.
+    #
+    # Without this the sort was on ["_key", "_rank"] alone, and pandas'
+    # multi-key sort is STABLE (np.lexsort), so between two standard lines for
+    # the same player and stat the PREVIOUSLY SAVED row always won. A line
+    # PrizePicks moved from 85.5 to 88.5 was therefore discarded on every
+    # re-paste, and the board and the record kept comparing the model against a
+    # number the market no longer posts. `freeze_projections` promises "new
+    # lines in that paste are frozen at their own time", and the moved line
+    # never reached it, because it was dropped before `save_lines`.
+    #
+    # Safe against the frozen record because FREEZE_KEYS includes `line`: the
+    # 85.5 pick stays frozen as the evidence it is, and 88.5 arrives as its own
+    # pick with its own first-seen timestamp. Nothing already recorded moves.
+    out["_ord"] = np.arange(len(out))
+    out = (out.sort_values(["_key", "_rank", "_ord"],
+                           ascending=[True, True, False])
               .drop_duplicates("_key", keep="first")
-              .drop(columns=["_key", "_rank"]))
+              .drop(columns=["_key", "_rank", "_ord"]))
     return out.reset_index(drop=True)
 
 

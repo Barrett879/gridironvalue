@@ -224,9 +224,15 @@ _TIER_CLASS = {"strong": "t-strong", "moderate": "t-mod", "weak": "t-weak",
 def _tier_badge(tier, edge) -> str:
     """How much this stat's lean is actually worth, measured.
 
-    Not a decoration. A receiving-yards gap and a pass-attempts gap of the same
-    size are opposite in sign as evidence (-5.7 against +10.1 points of
-    side-picking edge), and an unlabelled board presents them identically.
+    Not a decoration. A receiving-yards lean and a pass-attempts lean of the
+    same size are worth very different amounts as evidence (+2.9 against +11.5
+    points of side-picking edge), and an unlabelled board presents them
+    identically.
+
+    The figures quoted here were -5.7 and +10.1, from the retired rule that
+    leaned on the model-line gap. They are re-measured under the probability
+    rule and live in data/stat_reliability.csv, which is what this badge
+    actually reads.
     """
     t = str(tier or "unmeasured").lower()
     cls = _TIER_CLASS.get(t, "t-unk")
