@@ -829,3 +829,39 @@ def test_baseline_targets_fall_back_per_row_not_all_or_nothing():
         # firing again.
         zero = int((vals == 0).sum())
         assert zero < len(vals), f"{target} is exactly 0.00 for every row"
+
+
+def test_a_player_is_served_under_the_position_he_trained_as():
+    """The two feeds disagree, and the disagreement silently deletes projections.
+
+    The training table takes `position` from the weekly box score;
+    build_inference_rows takes it from the depth chart via _POS_MAP. On the 2026
+    week 1 board six players differed: five fullbacks who are RB in the box
+    score (Luepke, Gilliam, Ricard, Russell, Ouzts) and Justin Shorter, WR on
+    the chart and TE in the box score.
+
+    `applies = live["position"].isin(meta["positions"])` masks a target to NaN
+    for a position its model was not trained on, and the receiving models
+    register ["WR", "TE", "RB"], so every FB row lost targets, receptions and
+    receiving yards outright. The positional-defence block is keyed on position
+    too, so survivors were matched against a cohort they never trained against.
+    """
+    from gridlib import predict
+    from gridlib.cache import dc_path, read_parquet_or_none
+
+    proj = predict.project_week_cached(2026, 1)
+    hist = read_parquet_or_none(dc_path("player_week_2016_2025_v1.parquet"))
+    if proj is None or proj.empty or hist is None or hist.empty:
+        pytest.skip("no projection or backfill available")
+
+    trained = (hist.dropna(subset=["gsis_id", "position"])
+                   .groupby("gsis_id")["position"]
+                   .agg(lambda s: s.mode().iloc[0] if len(s.mode()) else None))
+    joined = proj[["gsis_id", "player_display_name", "position"]].join(
+        trained.rename("trained_as"), on="gsis_id")
+    disagree = joined[joined["trained_as"].notna()
+                      & (joined["position"] != joined["trained_as"])]
+    assert disagree.empty, (
+        "served under a position they never trained as:\n"
+        + disagree.head(8).to_string(index=False)
+    )

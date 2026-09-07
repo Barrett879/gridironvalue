@@ -344,26 +344,154 @@ def test_props_module_cannot_reach_the_network():
     AND their terms prohibit automated access, so solving the block would not
     make fetching acceptable.
 
-    Checked by parsing the module's imports rather than grepping its text: the
-    docstrings legitimately NAME the endpoint while explaining why nothing calls
-    it, and a text scan cannot tell those apart.
+    Checked by parsing imports rather than grepping text: the docstrings
+    legitimately NAME the endpoint while explaining why nothing calls it, and a
+    text scan cannot tell those apart.
+
+    PER SYMBOL, which is the point. The old version walked only props.py's own
+    direct imports, so it recorded the module name "fetch" and never looked
+    inside it. A two-line addition walked straight past:
+
+        def scrape_prizepicks():
+            from .fetch import _http_parquet
+            return _http_parquet("https://api.prizepicks.com/projections")
+
+    Banning the whole module is not the fix either: props.py legitimately
+    imports kickoff_series from gridlib.fetch, which is a pure function over a
+    DataFrame. The rule is not "do not touch fetch", it is "do not import
+    something that fetches", so each imported SYMBOL is resolved in its own
+    module and its body checked for network use, following calls one hop.
     """
     import ast
     import inspect
+    import pathlib as _pl
 
-    tree = ast.parse(inspect.getsource(props))
-    imported = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            imported.update(a.name.split(".")[0] for a in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            imported.add(node.module.split(".")[0])
-    network = {"requests", "urllib", "urllib3", "httpx", "aiohttp", "socket"}
-    assert not (imported & network), (
-        f"props.py imported a network library: {imported & network}. The "
-        f"ingestion path is paste-only by design."
+    NETWORK = {"requests", "urllib", "urllib3", "httpx", "aiohttp", "socket",
+               "ftplib", "websocket", "websockets", "curl_cffi", "pycurl"}
+    pkg_dir = _pl.Path(inspect.getsourcefile(props)).parent
+
+    def network_aliases(tree):
+        """Names bound in this module that ARE a network library."""
+        out = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for a in node.names:
+                    if a.name.split(".")[0] in NETWORK:
+                        out.add(a.asname or a.name.split(".")[0])
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                if node.module.split(".")[0] in NETWORK:
+                    out.update(a.asname or a.name for a in node.names)
+        return out
+
+    def uses_network(func, tree, aliases, depth=1):
+        """Does this function body touch a network alias, or call one that does."""
+        called = set()
+        for node in ast.walk(func):
+            if isinstance(node, ast.Name) and node.id in aliases:
+                return True
+            if isinstance(node, ast.Attribute):
+                base = node
+                while isinstance(base, ast.Attribute):
+                    base = base.value
+                if isinstance(base, ast.Name) and base.id in aliases:
+                    return True
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                called.add(node.func.id)
+            # a nested `from .x import y` inside the body counts too
+            if isinstance(node, ast.ImportFrom) and node.module:
+                if node.module.split(".")[0] in NETWORK:
+                    return True
+        if depth <= 0:
+            return False
+        for name in called:
+            peer = _func_named(tree, name)
+            if peer is not None and uses_network(peer, tree, aliases, depth - 1):
+                return True
+        return False
+
+    def _func_named(tree, name):
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                    and node.name == name:
+                return node
+        return None
+
+    props_tree = ast.parse(inspect.getsource(props))
+
+    # 1. props.py must not import a network library itself.
+    own = network_aliases(props_tree)
+    assert not own, (
+        "props.py imported a network library directly: %s" % sorted(own))
+
+    # 2. and must not import a sibling SYMBOL that reaches one.
+    offenders = []
+    for node in ast.walk(props_tree):
+        if not isinstance(node, ast.ImportFrom) or not node.level:
+            continue
+        for alias in node.names:
+            module_name = node.module or alias.name
+            path = pkg_dir / ("%s.py" % module_name.split(".")[0])
+            if not path.exists():
+                continue
+            sib_tree = ast.parse(path.read_text())
+            sib_aliases = network_aliases(sib_tree)
+            if not sib_aliases:
+                continue
+            if node.module is None:
+                continue          # `from . import uncertainty`, a module handle
+            func = _func_named(sib_tree, alias.name)
+            if func is not None and uses_network(func, sib_tree, sib_aliases):
+                offenders.append("%s.%s" % (module_name, alias.name))
+    assert not offenders, (
+        "props.py imported a fetching symbol: %s. The ingestion path is "
+        "paste-only by design: PrizePicks 403s server-side requests and their "
+        "terms prohibit automated access, so making the fetch work would not "
+        "make it allowed." % sorted(offenders)
     )
 
+def test_the_network_guard_actually_catches_a_laundered_fetcher():
+    """A guard nobody has watched fail is not known to work.
+
+    This is the exact two-line addition that walked past the previous version,
+    which recorded the module name "fetch" and never looked inside it.
+    """
+    import inspect
+    import pathlib as _pl
+    import subprocess
+    import sys
+    import tempfile
+
+    laundered = (
+        "\n\ndef scrape_prizepicks():\n"
+        "    from .fetch import _http_parquet\n"
+        "    return _http_parquet('https://api.prizepicks.com/projections')\n"
+    )
+    root = _pl.Path(inspect.getsourcefile(props)).parent.parent
+    with tempfile.TemporaryDirectory() as tmp:
+        shadow = _pl.Path(tmp) / "gridlib"
+        shadow.mkdir()
+        for module in (root / "gridlib").glob("*.py"):
+            (shadow / module.name).write_text(module.read_text())
+        (shadow / "props.py").write_text(
+            inspect.getsource(props) + laundered)
+        probe = _pl.Path(tmp) / "probe.py"
+        probe.write_text(
+            "import sys; sys.path.insert(0, %r)\n" % tmp
+            + "import gridlib.props as props\n"
+            + "import pytest\n"
+            + inspect.getsource(test_props_module_cannot_reach_the_network)
+            + "\ntry:\n"
+            + "    test_props_module_cannot_reach_the_network()\n"
+            + "    print('GUARD MISSED IT')\n"
+            + "except AssertionError:\n"
+            + "    print('GUARD CAUGHT IT')\n"
+        )
+        out = subprocess.run([sys.executable, str(probe)], capture_output=True,
+                             text=True, cwd=tmp)
+    assert "GUARD CAUGHT IT" in out.stdout, (
+        "the network guard did not catch a fetcher laundered through "
+        "gridlib.fetch. stdout=%r stderr=%r" % (out.stdout, out.stderr[-400:])
+    )
 
 # ── Demon and Goblin markers ─────────────────────────────────────────────────
 def test_demon_and_goblin_get_a_marker():

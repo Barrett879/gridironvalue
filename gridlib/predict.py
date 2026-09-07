@@ -446,6 +446,37 @@ def project_week(season: int, week: int,
     # whole thing, so the point-in-time helpers see genuine prior games.
     hist = hist[(hist["season"] < season)
                 | ((hist["season"] == season) & (hist["week"] < week))]
+
+    # SERVE A PLAYER UNDER THE POSITION HE TRAINED AS.
+    #
+    # The training table takes `position` from the weekly box score;
+    # build_inference_rows takes it from the depth chart via _POS_MAP. The two
+    # feeds disagree for a handful of players every week, and on the 2026 week 1
+    # board that was six: Hunter Luepke, Reggie Gilliam, Patrick Ricard, Brady
+    # Russell and Robbie Ouzts are all FB on the chart and RB in the box score,
+    # and Justin Shorter is WR on the chart and TE in the box score.
+    #
+    # It is not cosmetic. `applies = live["position"].isin(meta["positions"])`
+    # masks a target to NaN for a position the model was not trained on, and the
+    # receiving models register ["WR", "TE", "RB"], so every FB row lost its
+    # targets, receptions and receiving yards outright. The positional-defence
+    # block is also keyed on position, so the survivors were matched against a
+    # cohort they never trained against.
+    #
+    # History wins, because history is what the models saw. A player with no
+    # history keeps the depth-chart label, which is the only signal there is for
+    # him.
+    if "position" in hist.columns and not hist.empty:
+        _known = (hist.dropna(subset=["gsis_id", "position"])
+                      .groupby("gsis_id")["position"]
+                      .agg(lambda s: s.mode().iloc[0] if len(s.mode()) else None))
+        _mapped = inf["gsis_id"].map(_known)
+        _changed = int((_mapped.notna() & (_mapped != inf["position"])).sum())
+        if _changed:
+            logger.info(
+                "serving %d player(s) under the position they trained as "
+                "rather than their depth-chart label", _changed)
+        inf["position"] = _mapped.fillna(inf["position"])
     combined = pd.concat([hist, inf], ignore_index=True, sort=False)
     priors = reg.get("league_priors") or F.league_priors(hist, season)
     feat = F.build(combined, lg, priors)
