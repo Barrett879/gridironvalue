@@ -70,6 +70,12 @@ jobs:
           python scripts/build_player_week.py \
             --seasons ${{ steps.season.outputs.year }}-${{ steps.season.outputs.year }}
 
+      # The suite gates the COMMIT, not just the code. This job runs
+      # unattended and pushes a regenerated data file that the deployed site
+      # then serves, so a red leakage or train/serve-parity test must stop it.
+      - name: Test
+        run: python -m pytest -q -m "not network" tests/
+
       - name: Sanity check before committing
         run: |
           python - <<'PY'
@@ -90,8 +96,30 @@ jobs:
           if missing:
               sys.exit(f"current-season table is missing {len(missing)} columns "
                        f"the history has, e.g. {sorted(missing)[:5]}")
+          # Names alone are not enough. A table that keeps every column and
+          # arrives EMPTY passes a name comparison: measured against a
+          # synthetic rebuild that nulled every non-key column, the old check
+          # said "commit" on a table that was 97.7% null. That is the same
+          # class of defect that already shipped once, when routes_run_proxy
+          # was zero-filled for a whole live season and a feature trained at
+          # 20.20 served 0.00.
+          key = {"gsis_id", "season", "week", "team", "game_id", "position",
+                 "player_display_name"}
+          check = [c for c in hist.columns if c in df.columns and c not in key]
+          filled = df[check].notna().mean()
+          thin = filled[filled < 0.02]
+          # Some columns are legitimately sparse (a kicker's fg_att is null for
+          # every skill player), so this is not a per-column bar. It is a floor
+          # on the table as a whole: a real week is nowhere near this empty.
+          overall = float(filled.mean())
+          if overall < 0.25:
+              sys.exit(f"current-season table is {100 * (1 - overall):.1f}% "
+                       f"null across {len(check)} columns. It kept its column "
+                       "names and lost its values; refusing to commit.")
           print(f"ok: {len(df)} rows, {len(df.columns)} columns, "
-                f"weeks {int(df.week.min())}-{int(df.week.max())}")
+                f"weeks {int(df.week.min())}-{int(df.week.max())}, "
+                f"mean populated {100 * overall:.1f}% "
+                f"({len(thin)} near-empty columns)")
           PY
 
       - name: Commit if anything changed

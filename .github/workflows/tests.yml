@@ -1,0 +1,41 @@
+# Run the test suite on every push and pull request.
+#
+# WHY THIS EXISTS
+# ---------------
+# Nothing ran these automatically. 300 tests, including every leakage and
+# train/serve-parity check this project has built after five separate leaks,
+# executed only when a human remembered. Meanwhile Streamlit Cloud redeploys on
+# every push, and weekly-refresh runs unattended and COMMITS a regenerated data
+# file, so the two things that reach real users were both ungated.
+#
+# The suite reads committed cache artifacts and does not need the network, so
+# `-m "not network"` keeps this hermetic and fast.
+name: tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch: {}
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: pip install -r requirements.txt
+
+      - name: Test
+        run: python -m pytest -q -m "not network" tests/
