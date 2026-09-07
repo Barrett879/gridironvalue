@@ -193,10 +193,16 @@ else:
     if no_line:
         st.markdown(
             store.render_notice(
+                # Says what actually happens. It used to promise a "neutral
+                # game script" substitute and "widened uncertainty", and
+                # neither exists: predict.py copies the market straight off the
+                # game row and writes NaN when spread_line is missing, and
+                # nothing anywhere widens an interval for it.
                 f"<b>{no_line} of {len(games)} games have no market line yet.</b> "
-                "Lines populate closer to kickoff. Projections for those games "
-                "fall back to a neutral game script instead of a market-implied "
-                "one, which widens their uncertainty."
+                "Lines populate closer to kickoff. Until then the model has no "
+                "market signal for those games and projects them from form, "
+                "role and matchup alone. Their numbers are not marked any "
+                "differently, so read them as the rougher ones on the slate."
             ),
             unsafe_allow_html=True,
         )

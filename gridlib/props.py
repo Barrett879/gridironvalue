@@ -176,15 +176,15 @@ STAT_MAP: dict[str, tuple[tuple[str, ...], float]] = {
 
 # Props this model CANNOT price. Rejected by name, counted, and explained.
 REFUSE = {
-    "longest reception": "a maximum over plays, not a mean",
-    "longest rush": "a maximum over plays, not a mean",
-    "longest completion": "a maximum over plays, not a mean",
-    "longest passing completion": "a maximum over plays, not a mean",
-    "longest field goal": "a maximum over plays, not a mean",
+    "longest reception": "a maximum over plays, not a per-game central value",
+    "longest rush": "a maximum over plays, not a per-game central value",
+    "longest completion": "a maximum over plays, not a per-game central value",
+    "longest passing completion": "a maximum over plays, not a per-game central value",
+    "longest field goal": "a maximum over plays, not a per-game central value",
     "rush yards in first 5 attempts": "sequence-conditional, not a full-game stat",
     "receiving yards in first 2 receptions":
         "sequence-conditional, not a full-game stat",
-    "first td scorer": "an ordering, not a per-game mean",
+    "first td scorer": "an ordering, not a per-game central value",
     # "anytime td" was HERE as well as in STAT_MAP, and _resolve_stat checks
     # REFUSE first, so the prop was rejected with "a probability, not a mean;
     # needs a scoring model" while the identical mapping under the label
@@ -972,7 +972,15 @@ def compare(lines: pd.DataFrame, proj: pd.DataFrame,
 
     meta = {"posted": int(len(lines)), "refused": {}, "unmatched_players": 0,
             "unmapped_stats": {}, "matched": 0, "low_confidence": 0,
-            "baseline_served": 0, "unprojected_stat": 0}
+            "baseline_served": 0, "unprojected_stat": 0,
+            # The reason PER STAT, kept alongside the counts rather than
+            # replacing them, so every existing consumer of meta["refused"]
+            # still sees {stat: count}. The reason was computed and thrown
+            # away, and the UI then printed ONE blanket explanation over every
+            # refusal: "Longest-anything props are maxima over plays", which is
+            # true of the longest-* props and false of Sacks, Tackles and the
+            # sequence-conditional ones sitting in the same list.
+            "refused_why": {}}
     if lines.empty or proj.empty:
         meta["reason"] = ("no lines pasted" if lines.empty
                           else "no projections for this week")
@@ -992,10 +1000,12 @@ def compare(lines: pd.DataFrame, proj: pd.DataFrame,
     for _, ln in lines.iterrows():
         cols, scale, refusal = _resolve_stat(ln.get("stat_type"))
         if cols is None:
-            bucket = meta["refused"] if refusal in REFUSE.values() else \
-                meta["unmapped_stats"]
+            _is_refusal = refusal in REFUSE.values()
+            bucket = meta["refused"] if _is_refusal else meta["unmapped_stats"]
             k = str(ln.get("stat_type"))
             bucket[k] = bucket.get(k, 0) + 1
+            if _is_refusal:
+                meta["refused_why"][k] = refusal
             continue
 
         key = normalize_name(ln.get("name"))

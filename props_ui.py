@@ -390,9 +390,16 @@ def render_board(scope_proj: pd.DataFrame, season: int, week: int,
         st.markdown(
             store.render_notice(
                 "<b>Not priced: </b>"
-                + ", ".join(f"{esc(k)} ({v})" for k, v in meta["refused"].items())
-                + ". Longest-anything props are maxima over plays, and a "
-                "mean-projection model cannot price a maximum."),
+                # One clause per stat, with ITS OWN reason. This printed a
+                # single sentence about longest-anything maxima over the whole
+                # list, which was false for Sacks and Tackles (defensive, not
+                # projected) and for the sequence-conditional props sitting
+                # beside them. The reason was already computed per stat and
+                # thrown away.
+                + "; ".join(
+                    f"{esc(k)} ({v}): {esc(meta.get('refused_why', {}).get(k, 'not projected'))}"
+                    for k, v in meta["refused"].items())
+                + "."),
             unsafe_allow_html=True)
 
     # Drop rows whose lean is a side the board does not offer, and rows the
@@ -799,9 +806,20 @@ def render_week_record(season: int, weeks: list[int]) -> None:
         '<div class="gv-note">A hit rate above 50% over a handful of weeks is '
         "not evidence of an edge. The NFL plays 272 regular-season games a year "
         "against baseball's 2,430, so the confidence intervals here are wide "
-        "and any small edge claimed on half a season is noise. Weeks marked "
+        "and any small edge claimed on half a season is noise."
+        "<br><br>"
+        # TWO reasons a week is excluded, not one. The note named only "in
+        # sample", so a week whose Basis reads "recomputed" showed a hit rate
+        # that looks like it counts and does not, with nothing on the page
+        # saying why.
+        "A week counts toward the season record above only when <b>Basis</b> "
+        "reads <b>frozen</b> and <b>In sample</b> reads <b>no</b>. Weeks marked "
         "<b>in sample</b> are inside the model's training window, which makes "
-        "them a plumbing check rather than a test.</div>",
+        "them a plumbing check rather than a test. Weeks marked "
+        "<b>recomputed</b> have no snapshot of what the model said when the "
+        "line was first seen, so they are scored against the model as it "
+        "stands now, which flatters it. Their numbers are shown for "
+        "completeness and are not in the headline.</div>",
         unsafe_allow_html=True)
 
 
