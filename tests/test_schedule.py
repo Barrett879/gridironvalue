@@ -362,3 +362,54 @@ def test_depth_chart_weeks_never_come_from_after_the_season():
     assert set(range(1, 19)) <= set(norm["week"].astype(int)), (
         "dropping post-season snapshots removed a week from the chart entirely"
     )
+
+
+def test_an_empty_fetch_never_destroys_a_good_cache():
+    """stale-beats-empty, which load_release's docstring always claimed.
+
+    A FAILED fetch was handled. A SUCCESSFUL fetch carrying an empty parquet was
+    not: it took the `fresh is not None` branch, wrote zero rows over a good
+    cache and returned them. games.parquet, players.parquet and officials.parquet
+    all reuse one filename forever, so there is no version to fall back to; one
+    bad upstream publish would have emptied the cache the whole site is built
+    on, and load_schedules would have handed back an empty frame without
+    raising, which renders as "no games this week".
+    """
+    import logging
+    import pathlib
+    import tempfile
+
+    import pandas as pd
+
+    from gridlib import cache, fetch
+
+    logging.disable(logging.CRITICAL)
+    original_dir, original_http = cache.CACHE_DIR, fetch._http_parquet
+    try:
+        # 1. empty fetch with a good cache: cache preserved, stale served
+        d = pathlib.Path(tempfile.mkdtemp())
+        cache.CACHE_DIR = d
+        (d / "games.parquet").write_bytes(b"")
+        pd.DataFrame({"a": [1, 2, 3]}).to_parquet(d / "games.parquet")
+        fetch._http_parquet = lambda url: pd.DataFrame(columns=["a"])
+        got = fetch.load_release("schedules", "games.parquet", "games.parquet", ttl=0)
+        assert got is not None and len(got) == 3, "an empty fetch was served"
+        assert len(pd.read_parquet(d / "games.parquet")) == 3, (
+            "an empty fetch overwrote a good cache"
+        )
+
+        # 2. empty fetch with NO cache is a legitimately unpublished season and
+        #    must read as empty rather than as an error
+        cache.CACHE_DIR = pathlib.Path(tempfile.mkdtemp())
+        got = fetch.load_release("stats", "x_2099.parquet", "x_2099.parquet", ttl=0)
+        assert got is not None and got.empty
+
+        # 3. a good fetch still writes and returns
+        d3 = pathlib.Path(tempfile.mkdtemp())
+        cache.CACHE_DIR = d3
+        fetch._http_parquet = lambda url: pd.DataFrame({"a": [9, 9]})
+        got = fetch.load_release("schedules", "games.parquet", "games.parquet", ttl=0)
+        assert len(got) == 2 and (d3 / "games.parquet").exists()
+    finally:
+        cache.CACHE_DIR, fetch._http_parquet = original_dir, original_http
+        logging.disable(logging.NOTSET)

@@ -140,6 +140,10 @@ STAT_MAP: dict[str, tuple[tuple[str, ...], float]] = {
     # probability, not a rename.
     "player touchdowns": (("__prob__", "rushing_tds", "receiving_tds"), 1.0),
     "anytime td": (("__prob__", "rushing_tds", "receiving_tds"), 1.0),
+    # Same prop, spelled out. The feed's stat_type wording is not stable and an
+    # unmapped label is silently invisible rather than loud, so both spellings
+    # are carried.
+    "anytime touchdown": (("__prob__", "rushing_tds", "receiving_tds"), 1.0),
     # passing_tds belongs here and was missing, so a QB projected 1.9 passing
     # and 0.22 rushing touchdowns was priced on lambda = 0.22 instead of 2.12,
     # putting every quarterback row near 0% against a standard 1.5 line.
@@ -181,7 +185,11 @@ REFUSE = {
     "receiving yards in first 2 receptions":
         "sequence-conditional, not a full-game stat",
     "first td scorer": "an ordering, not a per-game mean",
-    "anytime td": "a probability, not a mean; needs a scoring model",
+    # "anytime td" was HERE as well as in STAT_MAP, and _resolve_stat checks
+    # REFUSE first, so the prop was rejected with "a probability, not a mean;
+    # needs a scoring model" while the identical mapping under the label
+    # "player touchdowns" priced fine. It is a probability, and the __prob__
+    # sentinel is exactly the scoring model the refusal said was missing.
     "tackles": "defensive; not projected in v1",
     "sacks": "defensive; not projected in v1",
 }
@@ -253,7 +261,7 @@ def parse_prizepicks_json(raw) -> pd.DataFrame:
                 a.get("position"),
             )
 
-    rows, skipped = [], 0
+    rows, skipped, skipped_badline = [], 0, 0
     wager_types: dict[str, int] = {}
     for p in data:
         if p.get("type") != "projection":
@@ -267,6 +275,17 @@ def parse_prizepicks_json(raw) -> pd.DataFrame:
         if a.get("line_score") is None or not name:
             skipped += 1
             continue
+        # PER ROW. This was a bare float() further down, inside the append, so a
+        # single non-numeric line_score raised ValueError out of the whole
+        # function; parse_any caught it, fell through to the board-text parser,
+        # and that returned nothing. One malformed row out of sixty discarded
+        # all sixty, and the visitor was told "Nothing readable in that paste"
+        # about a feed that was 59/60 valid.
+        try:
+            _line_val = float(a["line_score"])
+        except (TypeError, ValueError):
+            skipped_badline += 1
+            continue
         odds = str(a.get("odds_type") or "standard").lower()
         # The authoritative per-row answer. NEVER derived from odds_type: that
         # rule changed on 2026-08-21 and is now partial by sport and stat type,
@@ -277,13 +296,18 @@ def parse_prizepicks_json(raw) -> pd.DataFrame:
         rows.append({
             "name": name, "team": team, "position": pos,
             "stat_type": a.get("stat_type") or a.get("stat_display_name"),
-            "line": float(a["line_score"]),
+            "line": _line_val,
             "start_time": a.get("start_time"),
             "direction": direction,
             "odds_type": odds,
         })
     df = pd.DataFrame(rows)
     df.attrs["skipped_noname"] = skipped
+    # Rows whose line_score was not a number. Counted separately from
+    # skipped_noname because the two have different causes and different
+    # remedies, and because a silently dropped line is what this whole change
+    # is about: the previous code discarded the ENTIRE feed for one bad row.
+    df.attrs["skipped_badline"] = skipped_badline
     # Logged so a shift in the field's distribution shows up here rather than in
     # a user complaint. The NFL rollout landing will change these counts.
     df.attrs["allowed_wager_types"] = wager_types
@@ -294,7 +318,29 @@ def parse_prizepicks_json(raw) -> pd.DataFrame:
 
 _BOARD_NUM = re.compile(r"^\d+(\.\d+)?$")
 _BOARD_TEAMPOS = re.compile(r"^[A-Z]{2,4}\s*-\s*[A-Za-z0-9]{1,3}$")
-_BOARD_SUFFIX = re.compile(r"(Demon|Goblin)+$")
+# A LOOP, not a regex. This was re.compile(r"(Demon|Goblin)+$"), applied to a
+# whole pasted line. That pattern is ambiguously repeatable, so the engine
+# restarts from every offset and the match is quadratic in the line length:
+# measured through parse_any at 0.076s for 9.8 KB, 0.296s for 19.5 KB and 1.177s
+# for 39.1 KB, a clean 4x per doubling, which extrapolates to about eight
+# minutes of CPU for an 800 KB paste. The paste box is unauthenticated on the
+# public deployment and one shared process serves every visitor.
+# Note that (Demon|Goblin)*$ does NOT fix it: same ambiguous repeat, same
+# restart-from-every-offset behaviour.
+_BOARD_SUFFIXES = ("Demon", "Goblin")
+
+
+def _strip_board_suffix(text: str) -> str:
+    """Remove any trailing Demon/Goblin markers. Linear in the line length."""
+    out = str(text)
+    changed = True
+    while changed:
+        changed = False
+        for suffix in _BOARD_SUFFIXES:
+            if out.endswith(suffix):
+                out = out[: -len(suffix)]
+                changed = True
+    return out
 
 
 def parse_prizepicks_board(text: str) -> pd.DataFrame:
@@ -341,7 +387,7 @@ def parse_prizepicks_board(text: str) -> pd.DataFrame:
         j += 1
         if j >= len(lines):
             break
-        stat = _BOARD_SUFFIX.sub("", lines[j]).strip()
+        stat = _strip_board_suffix(lines[j]).strip()
         odds = "demon" if "Demon" in lines[j] else \
                "goblin" if "Goblin" in lines[j] else "standard"
         j += 1
@@ -881,6 +927,9 @@ def poisson_at_least(lam: float, k: int) -> float:
     for i in range(1, k):
         term *= lam / i
         cum += term
+    # PURE. No floor or ceiling here: this is the closed form, and callers test
+    # it against the closed form. The floor belongs where the CLAIM is made,
+    # which is compare(), not where the arithmetic is done.
     return float(min(1.0, max(0.0, 1.0 - cum)))
 
 
@@ -981,7 +1030,15 @@ def compare(lines: pd.DataFrame, proj: pd.DataFrame,
                 # dropped in silence.
                 meta["unprojected_stat"] += 1
                 continue
-            model_val = poisson_at_least(lam, threshold_for_line(line_val))
+            # Floored and capped at the SAME bounds every other probability on
+            # the site respects. Unclamped, a long-shot lambda rounds to 0.00
+            # and the board printed a flat "0%" beside a player who is going to
+            # be on the field: on the committed week 1 board that was George
+            # Holani, Player Touchdowns 1.5. Nothing here justifies a claim
+            # that certain, and the rest of the site already agreed.
+            from . import uncertainty as _u
+            model_val = min(_u.CEIL, max(_u.FLOOR,
+                            poisson_at_least(lam, threshold_for_line(line_val))))
             kind, compare_to = "probability", 0.5
             # Both components are served from a baseline; they lose the ship
             # gate to a season-to-date mean. Labelled, never dressed up.

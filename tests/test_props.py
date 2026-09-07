@@ -1520,3 +1520,130 @@ def test_published_edges_match_the_measurement():
         f"(stat, published, measured): {drift}. Re-run "
         "scripts/validate_lean_probability.py and sync data/stat_reliability.csv"
     )
+
+
+def test_anytime_td_is_priced_not_refused():
+    """It was in STAT_MAP and in REFUSE, and _resolve_stat checks REFUSE first.
+
+    So the prop was rejected with "a probability, not a mean; needs a scoring
+    model" while the identical mapping under the label "player touchdowns"
+    priced fine. It IS a probability, and the __prob__ sentinel is exactly the
+    scoring model the refusal said was missing.
+    """
+    from gridlib import props
+
+    cols, scale, refusal = props._resolve_stat("Anytime TD")
+    assert refusal is None, f"still refused: {refusal}"
+    assert cols == props.STAT_MAP["player touchdowns"][0], (
+        "anytime td must resolve to the same mapping as player touchdowns"
+    )
+    assert props._resolve_stat("anytime touchdown")[2] is None
+
+
+def test_probabilities_respect_the_site_floor_and_ceiling():
+    """A long-shot lambda rounded to 0.00 and the board printed a flat "0%".
+
+    On the committed week 1 board that was George Holani, Player Touchdowns
+    1.5. Nothing justifies a claim that certain about a player who will be on
+    the field, and every other probability on the site already respects
+    uncertainty.FLOOR / CEIL.
+
+    poisson_at_least itself stays PURE, because it is tested against the closed
+    form; the clamp belongs where the claim is made.
+    """
+    import math
+
+    from gridlib import predict, props
+    from gridlib import uncertainty as u
+
+    # the helper is the exact closed form, unclamped
+    assert props.poisson_at_least(0.69, 1) == pytest.approx(1 - math.exp(-0.69), abs=1e-9)
+    assert props.poisson_at_least(0.0, 1) == 0.0
+    assert props.poisson_at_least(2.0, 0) == 1.0
+
+    lines = props.load_lines(2026, 1)
+    proj = predict.project_week_cached(2026, 1)
+    if lines is None or lines.empty or proj is None or proj.empty:
+        pytest.skip("no committed board for 2026 week 1")
+    table, _meta = props.compare(lines, proj, predict.load_registry())
+    prob = table[table["kind"] == "probability"]
+    if prob.empty:
+        pytest.skip("no probability rows on this board")
+    lo, hi = float(prob["model"].min()), float(prob["model"].max())
+    assert lo >= u.FLOOR - 1e-9, f"a displayed probability is {lo}, below the floor"
+    assert hi <= u.CEIL + 1e-9, f"a displayed probability is {hi}, above the ceiling"
+
+
+def test_one_bad_line_score_costs_one_line_not_the_feed():
+    """A bare float() inside the row loop raised out of the whole function.
+
+    parse_any caught the ValueError, fell through to the board-text parser, and
+    that returned nothing. One malformed row out of sixty discarded all sixty,
+    and the visitor was told "Nothing readable in that paste" about a feed that
+    was 59/60 valid.
+    """
+    import json
+    import logging
+
+    from gridlib import props
+
+    def feed(bad_index=None):
+        data, included = [], []
+        for i in range(60):
+            score = "N/A" if i == bad_index else 10.0 + i
+            data.append({"type": "projection", "id": str(i),
+                         "attributes": {"stat_type": "Pass Yards",
+                                        "line_score": score, "description": "X"},
+                         "relationships": {"new_player": {"data": {"id": "p%d" % i}}}})
+            included.append({"type": "new_player", "id": "p%d" % i,
+                             "attributes": {"name": "Player %d Smith" % i,
+                                            "team": "KC", "position": "QB"}})
+        return json.dumps({"data": data, "included": included})
+
+    logging.disable(logging.CRITICAL)
+    try:
+        assert len(props.parse_any(feed())) == 60
+        got = props.parse_any(feed(bad_index=7))
+        assert len(got) == 59, f"one bad row cost {60 - len(got)} lines"
+        assert int(got.attrs.get("skipped_badline", 0)) == 1
+    finally:
+        logging.disable(logging.NOTSET)
+
+
+def test_board_suffix_stripping_is_linear():
+    """The paste box is unauthenticated and one process serves every visitor.
+
+    This was re.compile(r"(Demon|Goblin)+$") applied to a whole pasted line. The
+    repeat is ambiguous, so the engine restarts from every offset and the match
+    is quadratic: measured through parse_any at 0.076s for 9.8 KB, 0.296s for
+    19.5 KB and 1.177s for 39.1 KB, a clean 4x per doubling, extrapolating to
+    about eight minutes of CPU for an 800 KB paste.
+
+    Note (Demon|Goblin)*$ is NOT a fix; it has the same ambiguous repeat.
+    """
+    import logging
+    import time
+
+    from gridlib import props
+
+    assert props._strip_board_suffix("Pass YardsDemon") == "Pass Yards"
+    assert props._strip_board_suffix("Pass YardsGoblinDemon") == "Pass Yards"
+    assert props._strip_board_suffix("Pass Yards") == "Pass Yards"
+
+    logging.disable(logging.CRITICAL)
+    try:
+        timings = []
+        for n in (4000, 16000):
+            text = "John Smith\n120\n" + "Demon" * n + "!\nz\n"
+            start = time.time()
+            props.parse_any(text)
+            timings.append(time.time() - start)
+    finally:
+        logging.disable(logging.NOTSET)
+    # 4x the input. Quadratic would be ~16x the time; linear is ~4x. A generous
+    # bound of 8x still fails the quadratic implementation by a wide margin,
+    # while tolerating a slow machine.
+    assert timings[1] < max(timings[0] * 8.0, 0.5), (
+        f"suffix stripping looks superlinear: {timings[0]:.3f}s then "
+        f"{timings[1]:.3f}s for 4x the input"
+    )

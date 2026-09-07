@@ -121,11 +121,36 @@ def load_release(
             return cached
 
     fresh = _http_parquet(_release_url(tag, filename))
-    if fresh is not None:
+    stale = read_parquet_or_none(path)
+
+    # STALE BEATS EMPTY, which this docstring has always claimed and the code
+    # only half did. A failed fetch was handled; a SUCCESSFUL fetch carrying an
+    # empty parquet was not, and it took the `fresh is not None` branch, wrote
+    # zero rows over a good cache and returned them. Demonstrated against a
+    # seeded 3-row games.parquet with the fetch stubbed to return an empty
+    # frame: cached rows 3 before, 0 after, and load_schedules handed back an
+    # empty frame without raising, which renders as "no games this week".
+    #
+    # These files reuse one filename forever (games.parquet, players.parquet,
+    # officials.parquet), so there is no version to fall back to. One bad
+    # upstream publish would have emptied the cache the whole site is built on.
+    if fresh is not None and not fresh.empty:
         atomic_to_parquet(fresh, path)
         return fresh
 
-    stale = read_parquet_or_none(path)
+    if fresh is not None and stale is not None and not stale.empty:
+        logger.warning(
+            "%s fetched EMPTY (0 rows) but a good cached copy exists; keeping "
+            "the cache and serving it. Upstream may be mid-publish.", cache_name)
+        return stale
+
+    if fresh is not None:
+        # Empty with nothing cached. A season that genuinely is not published
+        # yet reads as empty rather than as an error, which is the correct
+        # preseason state, so this is still written and returned.
+        atomic_to_parquet(fresh, path)
+        return fresh
+
     if stale is not None:
         logger.warning("serving STALE %s (network fetch failed)", cache_name)
         return stale

@@ -70,6 +70,29 @@ def _lines(season: int, week: int) -> pd.DataFrame | None:
         pd.concat([saved, mine], ignore_index=True))
 
 
+def board_rows(table):
+    """The rows the board actually SHOWS, plus the two sets it withholds.
+
+    THE ONE DEFINITION. Four surfaces counted "lines" and only one of them ran
+    both filters, so the site disagreed with itself in public:
+
+      the slate-card pill promised 533 lines for 2026 week 1 and the game pages
+      showed 515; the ledger header printed "1066 lines on week 1" above a table
+      rendered from 1029 rows; and the accuracy record's "Shown" column, and the
+      set of picks it GRADED, counted rows the board had withheld for thin
+      history.
+
+    `filter_pickable` drops a lean the board does not offer. `filter_informed`
+    drops a player with too little history to rank. A row has to survive both to
+    reach a reader, so anything that counts, links to, or grades a row must
+    apply both. Returns (shown, hidden, thin) so every caller can still explain
+    the difference rather than shrinking in silence.
+    """
+    shown, hidden = props.filter_pickable(table)
+    shown, thin = props.filter_informed(shown)
+    return shown, hidden, thin
+
+
 def resolve_and_persist(season: int, week: int, games: pd.DataFrame | None = None):
     """Merge any freshly-pasted text into the saved set and persist it.
 
@@ -96,6 +119,15 @@ def resolve_and_persist(season: int, week: int, games: pd.DataFrame | None = Non
                 "board text."
             )
         elif got is not None and not got.empty:
+            # A partly-bad feed now costs only its bad rows, so say how many.
+            # Silence here is what the accounting work elsewhere is against: a
+            # reader who pastes 600 lines and sees 597 needs the other three
+            # explained, not hidden.
+            _bad = int(got.attrs.get("skipped_badline", 0) or 0)
+            if _bad:
+                note = (f"{_bad} line{'s' if _bad != 1 else ''} in that paste "
+                        "had no readable number and were skipped. The rest were "
+                        "saved.")
             got = props.collapse_alt_lines(got)
             routed = props.route_to_weeks(got, games, season) if games is not None else {}
             if not routed:
@@ -181,7 +213,7 @@ def line_counts_by_game(scope_proj: pd.DataFrame, season: int, week: int) -> dic
     # instead would promise a card of lines and then deliver fewer, which is
     # the kind of small inconsistency that makes a page feel broken.
     table, _meta = props.compare(lines, scope_proj, predict.load_registry())
-    pickable, _hidden = props.filter_pickable(table)
+    pickable, _hidden, _thin = board_rows(table)
     if pickable.empty or "game_id" not in pickable.columns:
         return {}
     return {str(gid): int(len(rows))
@@ -201,7 +233,7 @@ def props_by_name(scope_proj: pd.DataFrame, season: int, week: int) -> dict:
     # Same rule as the ledger: a lean the board does not offer is not a pick, so
     # it does not belong under a player's row either. Filtering in one place and
     # not the other would be worse than not filtering at all.
-    table, _hidden = props.filter_pickable(table)
+    table, _hidden, _thin = board_rows(table)
     if table.empty:
         return {}
     out: dict[str, list] = {}
@@ -337,11 +369,11 @@ def render_board(scope_proj: pd.DataFrame, season: int, week: int,
                 unsafe_allow_html=True)
         return 0
 
-    st.markdown(
-        f'<div class="gv-window"><span class="lab">Model vs market</span>'
-        f'<span class="meta">{len(table)} lines on {esc(scope_label)}</span>'
-        f'<span class="lock">biggest gaps first</span></div>',
-        unsafe_allow_html=True)
+    # `_n_matched` and not len(table): the header sits ABOVE the filters, so it
+    # was printing the raw match count over a table rendered from the filtered
+    # set. It read "1066 lines on week 1" above 1029 rows. Say both, since the
+    # difference is the point and the notes below already explain each part.
+    _n_matched = len(table)
 
     if meta["refused"]:
         st.markdown(
@@ -352,13 +384,21 @@ def render_board(scope_proj: pd.DataFrame, season: int, week: int,
                 "mean-projection model cannot price a maximum."),
             unsafe_allow_html=True)
 
-    # Drop rows whose lean is a side the board does not offer. Showing a "Less"
-    # on a prop that only sells "More" invites someone to act on a pick that
-    # does not exist. The hidden rows are counted, never silently swallowed.
-    table, hidden = props.filter_pickable(table)
-    # Then drop rows the model has no business ranking. An edge computed from an
-    # empty feature vector is the model's error, not the market's.
-    table, thin = props.filter_informed(table)
+    # Drop rows whose lean is a side the board does not offer, and rows the
+    # model has no business ranking. Showing a "Less" on a prop that only sells
+    # "More" invites someone to act on a pick that does not exist, and an edge
+    # computed from an empty feature vector is the model's error rather than the
+    # market's. Both sets are counted, never silently swallowed.
+    table, hidden, thin = board_rows(table)
+
+    _shown_txt = (f"{_n_matched} lines on {esc(scope_label)}"
+                  if len(table) == _n_matched
+                  else f"{len(table)} of {_n_matched} lines on {esc(scope_label)}")
+    st.markdown(
+        f'<div class="gv-window"><span class="lab">Model vs market</span>'
+        f'<span class="meta">{_shown_txt}</span>'
+        f'<span class="lock">biggest gaps first</span></div>',
+        unsafe_allow_html=True)
     if table.empty and not thin.empty:
         st.markdown(
             store.render_notice(
@@ -667,7 +707,7 @@ def render_week_record(season: int, weeks: list[int]) -> None:
         # Count what the board actually SHOWS, so this table reconciles with the
         # ledger above it and with the per-game card pills. Counting matches
         # instead would report a number the reader cannot find anywhere.
-        table, hidden_rows = props.filter_pickable(table)
+        table, hidden_rows, _thin_rows = board_rows(table)
         act = _actuals_for(season, w)
         graded = (props.grade(table, act)
                   if act is not None and not act.empty else pd.DataFrame())
