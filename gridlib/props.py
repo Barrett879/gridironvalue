@@ -286,6 +286,15 @@ def parse_prizepicks_json(raw) -> pd.DataFrame:
         except (TypeError, ValueError):
             skipped_badline += 1
             continue
+        # FINITE. float() happily returns inf for "Infinity" and "1e400" and
+        # nan for "nan", and Python's json module accepts the bare NaN and
+        # Infinity literals, so those reached compare() and raised
+        # OverflowError or ValueError out of int(np.floor(line)) with nothing
+        # above to catch it. That is the same "one paste replaces the page with
+        # a traceback" failure the try/except above was added to close.
+        if not np.isfinite(_line_val):
+            skipped_badline += 1
+            continue
         odds = str(a.get("odds_type") or "standard").lower()
         # The authoritative per-row answer. NEVER derived from odds_type: that
         # rule changed on 2026-08-21 and is now partial by sport and stat type,
@@ -331,16 +340,28 @@ _BOARD_SUFFIXES = ("Demon", "Goblin")
 
 
 def _strip_board_suffix(text: str) -> str:
-    """Remove any trailing Demon/Goblin markers. Linear in the line length."""
+    """Remove any trailing Demon/Goblin markers. Linear, and MEASURED so.
+
+    The regex this replaced, `(Demon|Goblin)+$`, was quadratic because the
+    repeat is ambiguous and the engine restarts from every offset. The first
+    replacement was a `while out.endswith(...): out = out[:-5]` loop, which is
+    ALSO quadratic, because Python string slicing copies: measured at 0.028s for
+    100 KB, 0.105s for 200 KB and 0.296s for 400 KB, the same clean 4x per
+    doubling the regex had. The docstring claimed linear and the commit message
+    condemned exactly this signature.
+
+    Walking an index backwards copies once, at the end.
+    """
     out = str(text)
-    changed = True
-    while changed:
-        changed = False
+    end = len(out)
+    while True:
         for suffix in _BOARD_SUFFIXES:
-            if out.endswith(suffix):
-                out = out[: -len(suffix)]
-                changed = True
-    return out
+            n = len(suffix)
+            if end >= n and out[end - n:end] == suffix:
+                end -= n
+                break
+        else:
+            return out[:end]
 
 
 def parse_prizepicks_board(text: str) -> pd.DataFrame:
@@ -773,7 +794,18 @@ def saved_weeks(season: int) -> list[int]:
 # reads the frozen value. FIRST SEEN WINS: re-pasting a board on Saturday must
 # not overwrite Wednesday's projection with one that has since absorbed three
 # days of injury news. New lines in that paste are frozen at their own time.
-FREEZE_KEYS = ["player", "stat", "line"]
+# NO `line`. One real game outcome is ONE pick, and the record must count it
+# once. Including the line meant a market move created a SECOND frozen row for
+# the same player and stat, so the same result was graded twice: n inflated and
+# the Wilson interval on the published hit rate narrowed for free. Demonstrated
+# on the real chain: freezing A.J. Brown Receiving Yards at 85.5 on Wednesday
+# and again at 88.5 on Saturday produced two frozen rows for one game.
+#
+# First seen still wins, which is the point: the record keeps the pick that was
+# actually made, at the line it was made against, and the BOARD is free to move
+# to the new line. That is the same "the board is a view, the record is
+# evidence" split the rest of this module rests on.
+FREEZE_KEYS = ["player", "stat"]
 
 
 def snapshot_path(season: int, week: int):
@@ -817,7 +849,17 @@ def freeze_projections(season: int, week: int, table: pd.DataFrame,
     if path.exists():
         try:
             payload = json_load(path)
-            existing = {r["_key"]: r for r in payload.get("rows", [])}
+            for r in payload.get("rows", []):
+                # Re-derived from the row's OWN fields rather than trusting the
+                # stored `_key` string, so a change to FREEZE_KEYS migrates in
+                # place instead of re-freezing the whole record under a new
+                # format. If two old rows collapse onto one new key, the
+                # EARLIEST is kept, because first seen wins.
+                k = _freeze_key(r)
+                prior = existing.get(k)
+                if prior is None or str(r.get("frozen_at") or "") < str(
+                        prior.get("frozen_at") or ""):
+                    existing[k] = r
         except Exception as e:  # noqa: BLE001
             logger.warning("could not read snapshot %s: %s", path, e)
 
@@ -921,6 +963,14 @@ def poisson_at_least(lam: float, k: int) -> float:
         return float("nan")
     if k <= 0:
         return 1.0
+    # BOUNDED. `k` comes from threshold_for_line(line) and `line` comes straight
+    # from a visitor's paste, so this loop's length was attacker-controlled and
+    # unbounded: measured at 8.9e-8 s per iteration, a pasted line of 1e9 costs
+    # about 90 seconds of the one process serving every visitor, and 1e18 costs
+    # longer than the age of the universe. Past this many events the answer is
+    # zero to far more precision than anything here reports.
+    if k > MAX_COUNT_THRESHOLD:
+        return 0.0
     # P(X >= k) = 1 - sum_{i<k} pmf(i), summed forward to stay stable at small k.
     term = np.exp(-lam)
     cum = term
@@ -931,6 +981,12 @@ def poisson_at_least(lam: float, k: int) -> float:
     # it against the closed form. The floor belongs where the CLAIM is made,
     # which is compare(), not where the arithmetic is done.
     return float(min(1.0, max(0.0, 1.0 - cum)))
+
+
+# The largest count any NFL prop can plausibly ask about. Touchdowns, field
+# goals, receptions and interceptions all live well under this; the number
+# exists only to bound a loop whose length comes from a visitor's paste.
+MAX_COUNT_THRESHOLD = 100
 
 
 def threshold_for_line(line: float) -> int:

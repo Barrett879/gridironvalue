@@ -839,12 +839,40 @@ def test_freeze_is_first_seen_wins(tmp_path, monkeypatch):
     assert back.iloc[0]["model_version"] == "old"
 
 
-def test_freeze_adds_lines_that_are_genuinely_new(tmp_path, monkeypatch):
-    """First-seen-wins must not become never-add: a Saturday re-paste carries
-    lines that did not exist on Wednesday, and those get their own timestamp."""
+def test_a_moved_line_does_not_enter_the_record_twice(tmp_path, monkeypatch):
+    """One real game outcome is ONE pick and must be counted once.
+
+    FREEZE_KEYS used to include `line`, so a market move from 245.5 to 252.5
+    created a SECOND frozen row for the same player and stat and the same
+    result was graded twice: n inflated and the Wilson interval on the
+    published hit rate narrowed for free.
+
+    First seen still wins, which is the point. The record keeps the pick that
+    was actually made, at the line it was made against; the BOARD is free to
+    move to the new line, and does.
+    """
     monkeypatch.setattr(props, "dc_path", lambda name: tmp_path / name)
     props.freeze_projections(2026, 1, _frozen_table(line=245.5), "v")
     added = props.freeze_projections(2026, 1, _frozen_table(line=252.5), "v")
+    frozen = props.load_frozen(2026, 1)
+    assert added == 0, "a moved line was frozen as a second pick"
+    assert len(frozen) == 1, (
+        f"{len(frozen)} frozen rows for one player and stat; one game outcome "
+        "would be graded more than once"
+    )
+    assert float(frozen.iloc[0]["line"]) == 245.5, (
+        "the record kept the moved line rather than the pick actually made"
+    )
+
+
+def test_freeze_adds_a_genuinely_new_prop(tmp_path, monkeypatch):
+    """First-seen-wins must not become never-add: a Saturday re-paste carries
+    props that did not exist on Wednesday, and those get their own timestamp."""
+    monkeypatch.setattr(props, "dc_path", lambda name: tmp_path / name)
+    props.freeze_projections(2026, 1, _frozen_table(line=245.5), "v")
+    other = _frozen_table(line=45.5)
+    other["stat"] = "Rush Yards"
+    added = props.freeze_projections(2026, 1, other, "v")
     assert added == 1
     assert len(props.load_frozen(2026, 1)) == 2
 
@@ -1587,25 +1615,26 @@ def test_a_moved_line_replaces_the_stale_one_on_re_paste():
     assert float(got2["line"].iloc[0]) == 85.5
 
 
-def test_a_moved_line_does_not_disturb_what_is_already_frozen():
-    """FREEZE_KEYS includes `line`, so 85.5 and 88.5 are different picks.
+def test_the_freeze_key_ignores_the_line_value():
+    """The board may follow a moved line; the RECORD may not.
 
-    That is what makes it safe for the newer line to win on the board: the
-    original pick stays frozen as the evidence it is, and the moved line
-    arrives as its own pick with its own first-seen time. If `line` ever leaves
-    the freeze key, letting the newer line win would start rewriting history.
+    This test previously asserted the opposite, that `line` must be IN the
+    freeze key, on the reasoning that 85.5 and 88.5 are "different picks so
+    nothing already recorded moves". That reasoning was backwards: including
+    the line is exactly what let a market move add a second frozen row for one
+    real game outcome, so the same result was graded twice.
     """
     from gridlib import props
 
-    assert "line" in props.FREEZE_KEYS, (
-        "the freeze key no longer includes the line value, so a moved line "
-        "would overwrite the frozen record of the pick actually made"
+    assert "line" not in props.FREEZE_KEYS, (
+        "the freeze key includes the line value again, so a moved line adds a "
+        "second pick and one game outcome is graded twice"
     )
     a = props._freeze_key({"player": "Josh Allen", "stat": "Pass Yards",
                            "line": 85.5})
     b = props._freeze_key({"player": "Josh Allen", "stat": "Pass Yards",
                            "line": 88.5})
-    assert a != b
+    assert a == b, "the same prop at two lines must be one record key"
 
 
 def test_published_edges_match_the_measurement():
@@ -1899,3 +1928,68 @@ def test_a_paste_is_applied_once_not_on_every_rerun(tmp_path, monkeypatch):
         assert props_ui.saved_count(2026, 1) == 1
     finally:
         st.session_state.clear()
+
+
+def test_a_pasted_line_cannot_run_an_unbounded_loop():
+    """`k` came from a visitor's paste and bounded a Python loop.
+
+    threshold_for_line(line) is floor(line) + 1 with no cap, and
+    poisson_at_least runs `for i in range(1, k)`. Measured at 8.9e-8 s per
+    iteration: a pasted line of 1e9 costs about 90 seconds of the one process
+    serving every visitor, and 1e18 costs longer than the age of the universe.
+    """
+    import time
+
+    from gridlib import props
+
+    for line in (1e6, 1e9, 1e18):
+        start = time.time()
+        got = props.poisson_at_least(0.5, props.threshold_for_line(line))
+        elapsed = time.time() - start
+        assert elapsed < 0.5, f"line {line:g} took {elapsed:.2f}s"
+        assert got == 0.0, f"line {line:g} returned {got}"
+    # and the ordinary range is untouched
+    assert props.poisson_at_least(0.5, 1) == pytest.approx(0.3935, abs=1e-3)
+
+
+def test_a_non_finite_line_is_rejected_not_crashed_on():
+    """float() returns inf for "Infinity" and "1e400" and nan for "nan", and
+    Python's json module accepts the bare NaN and Infinity literals.
+
+    Those reached compare() and raised OverflowError or ValueError out of
+    int(np.floor(line)), with nothing above to catch it: the same "one paste
+    replaces the page with a traceback" failure the per-row guard was added to
+    close.
+    """
+    import json
+    import logging
+
+    from gridlib import predict, props
+
+    logging.disable(logging.CRITICAL)
+    try:
+        for raw in ("Infinity", "-Infinity", "nan", "1e400"):
+            payload = {
+                "data": [{"type": "projection", "id": "1",
+                          "attributes": {"stat_type": "Player Touchdowns",
+                                         "line_score": raw, "description": "X"},
+                          "relationships": {"new_player": {"data": {"id": "p1"}}}}],
+                "included": [{"type": "new_player", "id": "p1",
+                              "attributes": {"name": "A.J. Brown", "team": "PHI",
+                                             "position": "WR"}}]}
+            got = props.parse_any(json.dumps(payload))
+            assert got.empty, f"{raw} survived the parser as {got['line'].tolist()}"
+            assert int(got.attrs.get("skipped_badline", 0)) == 1
+
+        # and a non-finite line that somehow reaches compare must not raise
+        proj = predict.project_week_cached(2026, 1)
+        if proj is None or proj.empty:
+            return
+        import numpy as np
+        bad = pd.DataFrame([{"name": str(proj.iloc[0]["player_display_name"]),
+                             "stat_type": "Player Touchdowns",
+                             "line": np.inf, "odds_type": "standard",
+                             "direction": None}])
+        props.compare(bad, proj, predict.load_registry())     # must not raise
+    finally:
+        logging.disable(logging.NOTSET)

@@ -145,6 +145,11 @@ def attach_p_play(df: pd.DataFrame,
         return out
     rank = pd.to_numeric(out.get("depth_rank"), errors="coerce")
     out["_rank_capped"] = rank.clip(upper=MAX_RANK).fillna(MAX_RANK).astype(int)
+    # The grid is keyed on the DEPTH-CHART position, and `depth_rank` is a rank
+    # within that chart group, so the lookup must use the chart label even when
+    # the serving position has been resolved to the one the player trained as.
+    _pos = (out["chart_position"] if "chart_position" in out.columns
+            else out["position"])
 
     status = (out["report_status"] if "report_status" in out.columns
               else pd.Series(pd.NA, index=out.index))
@@ -164,7 +169,7 @@ def attach_p_play(df: pd.DataFrame,
     any_col = "p_play_any" if "p_play_any" in grid.columns else "p_play"
     idx = grid.set_index(["position", "rank_capped"])
     key_h, key_a = idx["p_play"], idx[any_col]
-    keys = list(zip(out["position"], out["_rank_capped"]))
+    keys = list(zip(_pos, out["_rank_capped"]))
     p = np.array([float((key_h if f else key_a).get(k, 0.5))
                   for k, f in zip(keys, filed)])
 
@@ -371,9 +376,15 @@ def project_week_cached(season: int, week: int, ttl: int = 3600,
             got = read_parquet_or_none(path)
             if got is not None:
                 return got
-        hit = _LAST_BUILD.get("value")
-        if hit is not None and _LAST_BUILD.get("key") == key \
-                and (time.time() - float(_LAST_BUILD.get("at", 0))) < ttl:
+        # ONE snapshot, not three lookups. Read separately, another thread
+        # could clear-and-replace the record between grabbing `value` and
+        # checking `key`, so the reader validated the NEW key against the OLD
+        # frame and returned a different week's projections under this week's
+        # name. dict.copy() is atomic under the GIL.
+        snap = _LAST_BUILD.copy()
+        hit = snap.get("value")
+        if hit is not None and snap.get("key") == key \
+                and (time.time() - float(snap.get("at", 0))) < ttl:
             return hit
         return None
 
@@ -390,8 +401,11 @@ def project_week_cached(season: int, week: int, ttl: int = 3600,
             return cached
         fresh = project_week(season, week, games)
         if not fresh.empty:
+            # Replaced wholesale rather than cleared-then-filled, so a reader
+            # never observes a half-written record.
+            _LAST_BUILD["_next"] = None
             _LAST_BUILD.clear()
-            _LAST_BUILD.update(key=key, value=fresh, at=time.time())
+            _LAST_BUILD.update({"key": key, "value": fresh, "at": time.time()})
             # kickoff is tz-aware; parquet round-trips it fine, but drop the
             # column if it ever causes trouble rather than failing the write.
             try:
@@ -470,6 +484,12 @@ def project_week(season: int, week: int,
         _known = (hist.dropna(subset=["gsis_id", "position"])
                       .groupby("gsis_id")["position"]
                       .agg(lambda s: s.mode().iloc[0] if len(s.mode()) else None))
+        # KEEP the depth-chart label. The availability grid is fit and keyed on
+        # depth_chart_normalized's position, and `depth_rank` means rank WITHIN
+        # that chart position group, so looking a rewritten FB1 up as RB1 reads
+        # 0.971 where the honest answer is 0.498. The model position and the
+        # chart position are two different things and both are needed.
+        inf["chart_position"] = inf["position"]
         _mapped = inf["gsis_id"].map(_known)
         _changed = int((_mapped.notna() & (_mapped != inf["position"])).sum())
         if _changed:
@@ -545,7 +565,13 @@ def project_week(season: int, week: int,
                 _m = pd.to_numeric(_tr, errors="coerce").mean()
                 if pd.notna(_m):
                     fill = float(_m)
-            live[target] = base.fillna(fill)
+            # MASKED, like every model-served target. Without this the
+            # baseline branch wrote its fill to every row in the frame, so a
+            # quarterback carried a receiving-touchdown number pooled over
+            # WR/TE/RB. Model targets guard with exactly this mask and write
+            # NaN outside it.
+            _applies = live["position"].isin(meta.get("positions") or []).to_numpy()
+            live[target] = np.where(_applies, base.fillna(fill), np.nan)
             continue
         path = MODELS_DIR / meta["file"]
         if not path.exists():
@@ -582,10 +608,18 @@ def project_week(season: int, week: int,
     # frame. A team can file a report with no skill-position designations on
     # it, and inferring would then read that team as not having filed and serve
     # it the marginal rate, quietly shaving its whole slate.
+    # A team counts as having filed only when its report carries an actual
+    # DESIGNATION. Testing row presence alone put a team on the healthy grid
+    # off a Wednesday practice-participation report with zero resolved
+    # statuses: on the 2026 week 1 feed that is 11 rows, all NE and SEA, every
+    # report_status null, and it moved 42 of 608 rows onto the higher column
+    # while carrying no information to condition on.
     _inj = fetch.injury_report(season, week)
-    _filed = (set(_inj["team"].dropna().unique())
-              if _inj is not None and not _inj.empty and "team" in _inj.columns
-              else None)
+    _filed = None
+    if (_inj is not None and not _inj.empty
+            and {"team", "report_status"} <= set(_inj.columns)):
+        _designated = _inj[_inj["report_status"].notna()]
+        _filed = set(_designated["team"].dropna().unique())
     live = attach_p_play(live, filed_teams=_filed)
 
     keep = ["gsis_id", "player_display_name", "position", "team",

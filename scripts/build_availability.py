@@ -273,8 +273,6 @@ def main() -> None:
 
     print(f"\nfitting on {lo}-{hi}")
     grid, adj = build(seasons)
-    atomic_to_parquet(grid, dc_path(f"availability_{lo}_{hi}_{VERSION}.parquet"))
-    atomic_to_parquet(adj, dc_path(f"availability_adj_{lo}_{hi}_{VERSION}.parquet"))
 
     print(f"\nP(appears | team playing), {lo}-{hi}, shrunk with k={SHRINK_K:.0f}\n")
     print(f"  {'pos':<5}{'rank':>5}{'n':>8}{'raw':>8}{'healthy':>9}{'any':>8}")
@@ -315,8 +313,19 @@ def main() -> None:
     if not 0.95 <= exp / act <= 1.05:
         raise SystemExit(
             f"grid sums to {exp / act:.3f} of actual appearances. That gap "
-            "becomes a team-total gap on every projection; do not ship it.")
+            "becomes a team-total gap on every projection; do not ship it. "
+            "Nothing was written.")
     print("  within 5%, so team totals will not be dragged by availability.")
+
+    # WRITTEN LAST, and that ordering is the point. Both artifacts used to be
+    # written before this gate ran, and atomic_to_parquet is a tmp-write plus
+    # os.replace, so a grid the gate then refused with "do not ship it" had
+    # already clobbered the good one on disk. The next run would read the bad
+    # file, and the refusal message would be false.
+    atomic_to_parquet(grid, dc_path(f"availability_{lo}_{hi}_{VERSION}.parquet"))
+    atomic_to_parquet(adj, dc_path(f"availability_adj_{lo}_{hi}_{VERSION}.parquet"))
+    print(f"\nwrote availability_{lo}_{hi}_{VERSION}.parquet "
+          f"and availability_adj_{lo}_{hi}_{VERSION}.parquet")
 
 
 if __name__ == "__main__":
