@@ -315,20 +315,26 @@ def test_latest_depth_chart_is_unchanged_by_the_memo():
     assert not bad, f"memoized slices differ for {bad}"
 
 
-def test_depth_chart_weeks_never_come_from_after_the_season():
-    """A snapshot taken after the last kickoff describes no week of this season.
+def test_depth_chart_weeks_never_come_from_after_that_team_kicked_off():
+    """A snapshot must describe a game that has not been played yet.
 
-    It used to be CLIPPED onto the final week, which put post-season and
-    offseason information into `depth_rank`, `depth_rank_capped` and
-    `is_starter`, all classified PREGAME and all shipped features. The 2025 file
-    runs to 2026-03-14, after the Super Bowl and after the 2026 league year
-    opened, and 89.6% of the rows landing on week 18 were taken after week 18
-    had kicked off. `depth_chart_normalized` keeps the LATEST snapshot per
-    (team, week, player), so every week-18 rank came from March.
+    PER TEAM, because the bucket boundary is per team. Two defects lived here.
+
+    Snapshots after the last kickoff were CLIPPED onto the final week, and the
+    2025 file runs to 2026-03-14, after the Super Bowl, so 89.6% of the rows
+    landing on week 18 were taken after week 18 had kicked off and every week-18
+    depth rank came from March. depth_rank, depth_rank_capped and is_starter are
+    all classified PREGAME and all three are shipped features.
+
+    And the boundary was the week's LEAGUE-WIDE first kickoff, which is Thursday
+    night. The week-5 bucket held snapshots only to 2025-10-02 while week 5 ran
+    to 2025-10-07, so every Friday and Saturday chart for a Sunday game was
+    labelled week 6, and a Sunday game was served a Thursday-morning chart.
     """
     import pandas as pd
 
     from gridlib import fetch
+    from gridlib.teams import canonical
 
     dc = fetch.load_depth_charts(2025)
     if dc is None or dc.empty or "dt" not in dc.columns:
@@ -338,31 +344,36 @@ def test_depth_chart_weeks_never_come_from_after_the_season():
     reg = sched[(sched["season"] == 2025) & (sched["game_type"] == "REG")]
     if reg.empty:
         pytest.skip("no 2025 schedule")
-
-    ts = pd.to_datetime(dc["dt"], format="ISO8601", utc=True, errors="coerce")
     kick = fetch.kickoff_series(reg).dt.tz_convert("UTC")
-    first_by_week = kick.groupby(reg["week"].to_numpy()).min()
+    per_team = pd.concat([
+        pd.DataFrame({"team": reg[side].map(canonical).to_numpy(),
+                      "week": reg["week"].to_numpy(),
+                      "kick": kick.to_numpy()})
+        for side in ("home_team", "away_team")
+    ], ignore_index=True)
 
-    dated = dc.assign(_ts=ts)
-    dated = dated[dated["week"].notna() & dated["_ts"].notna()]
-    late = 0
-    for week, group in dated.groupby("week"):
-        cutoff = first_by_week.get(int(week))
-        if cutoff is None:
-            continue
-        late += int((group["_ts"] > cutoff).sum())
+    dated = dc.assign(
+        _ts=pd.to_datetime(dc["dt"], format="ISO8601", utc=True, errors="coerce"),
+        _tm=dc["team"].map(canonical))
+    dated = dated[dated["week"].notna() & dated["_ts"].notna()].copy()
+    dated["_wk"] = dated["week"].astype(int)
+    per_team["week"] = per_team["week"].astype(int)
+
+    # Vectorized: 500k snapshots, so a per-row lookup is not viable.
+    merged = dated.merge(per_team, left_on=["_tm", "_wk"],
+                         right_on=["team", "week"], how="left",
+                         suffixes=("", "_sched"))
+    late = int((merged["kick"].notna() & (merged["_ts"] > merged["kick"])).sum())
     assert late == 0, (
-        f"{late} depth-chart snapshots are assigned to a week that had already "
-        "kicked off when they were taken; a pregame feature is carrying "
-        "postgame information"
+        f"{late} depth-chart snapshots are assigned to a week whose game that "
+        "TEAM had already played when the snapshot was taken; a pregame "
+        "feature is carrying postgame information"
     )
-
-    # ...and the season must not lose a week to the fix.
+    # ...and the season must not lose a week to any of this.
     norm = fetch.depth_chart_normalized(2025)
     assert set(range(1, 19)) <= set(norm["week"].astype(int)), (
-        "dropping post-season snapshots removed a week from the chart entirely"
+        "bucketing dropped a week from the chart entirely"
     )
-
 
 def test_an_empty_fetch_never_destroys_a_good_cache():
     """stale-beats-empty, which load_release's docstring always claimed.

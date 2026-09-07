@@ -1811,19 +1811,27 @@ def test_no_displayed_row_contradicts_itself():
             continue
         model_txt = strip(props_ui._fmt_model(row))
         gap_html = props_ui._fmt_gap(row)
-        gap_txt = strip(gap_html)
+        gap_txt = strip(gap_html).replace("<", "<")
         line_txt = f'{float(row["line"]):.2f}'
-        # 1. the displayed model must not equal the displayed line
-        if f'{float(model_txt):.2f}' == line_txt:
-            bad.append((row["player"], row["stat"], model_txt, gap_txt, lean,
-                        "model displays as the line itself"))
-            continue
-        # 2. the displayed gap must carry a sign that matches the lean
-        want = "+" if lean == "More" else "-"
-        if not gap_txt.startswith(want):
-            bad.append((row["player"], row["stat"], model_txt, gap_txt, lean,
-                        "gap sign disagrees with the lean"))
-            continue
+        tied = f'{float(model_txt):.2f}' == line_txt
+        # 1. If the displayed model equals the displayed line, the gap may not
+        #    claim a readable number. The median genuinely CAN equal the line
+        #    (Trey McBride, 8.0 targets against an 8.0 line, P(over) 0.495 is a
+        #    real Less and a gap of nothing), so the rule is that the row must
+        #    say so rather than invent digits or print a signed zero.
+        if tied:
+            if "0.01" not in gap_txt:
+                bad.append((row["player"], row["stat"], model_txt, gap_txt,
+                            lean, "model equals the line but the gap claims a "
+                                  "readable number"))
+                continue
+        else:
+            # 2. otherwise the displayed gap must carry the lean's sign
+            want = "+" if lean == "More" else "-"
+            if not gap_txt.startswith(want):
+                bad.append((row["player"], row["stat"], model_txt, gap_txt,
+                            lean, "gap sign disagrees with the lean"))
+                continue
         # 3. and it must be coloured, not the neutral zero
         if 'class="num diff"' in gap_html:
             bad.append((row["player"], row["stat"], model_txt, gap_txt, lean,

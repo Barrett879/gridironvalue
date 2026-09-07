@@ -38,6 +38,7 @@ from functools import lru_cache
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 import requests
 
@@ -418,22 +419,31 @@ def load_depth_charts(season: int, ttl: int = 1800):
 def _attach_week_from_timestamp(df: pd.DataFrame, season: int) -> pd.DataFrame:
     """Map each depth-chart snapshot timestamp onto the NFL week it describes.
 
-    A snapshot taken at time T describes the roster going into the next game, so
-    it belongs to the week whose first kickoff is the earliest one at or after
-    T. A snapshot taken after the LAST regular-season kickoff describes no week
-    of this season and is dropped.
+    A snapshot taken at time T describes the roster going into that TEAM'S next
+    game, so it belongs to the week of the earliest kickoff at or after T FOR
+    THAT TEAM. A snapshot taken after the team's last regular-season kickoff
+    describes no week of this season and is dropped.
 
-    It used to be pinned to the final week instead, which put post-season and
-    offseason information into a pregame feature. The 2025 file runs to
-    2026-03-14, after the Super Bowl and after the 2026 league year opened, and
-    89.6% of the rows that landed on week 18 were taken after week 18 had
-    already kicked off. `depth_chart_normalized` keeps the LATEST snapshot per
-    (team, week, player), so every week-18 depth rank came from March. Of the
-    387 week-18 rows in the backfill, 146 of the 382 joinable ones had a rank
-    that differed from the last one published before kickoff, and `is_starter`
-    flipped on 36. Kirk Cousins is rank 1 in the pre-kickoff chart, and started
-    with 32 attempts, and rank 2 in the shipped one.
+    PER TEAM, and that is the whole point. The boundary used to be the week's
+    league-wide FIRST kickoff, which is Thursday night. Measured on 2025, the
+    week-5 bucket therefore held snapshots only up to 2025-10-02 07:15 UTC while
+    week 5's games ran to 2025-10-07: every Friday and Saturday chart for a
+    Sunday game was labelled week 6. Since `depth_chart_normalized` keeps the
+    LATEST snapshot per (team, week, player), a Sunday game was served a
+    Thursday-morning depth chart and lost two days of roster news, which is
+    exactly the signal depth rank exists to carry. Only the one or two teams
+    playing on Thursday were bucketed correctly.
+
+    Snapshots after the last kickoff also used to be CLIPPED onto the final
+    week rather than dropped, which put post-season and offseason information
+    into a pregame feature: the 2025 file runs to 2026-03-14, after the Super
+    Bowl, and 89.6% of the rows landing on week 18 were taken after week 18 had
+    kicked off. Kirk Cousins read rank 2 from a March snapshot; the chart
+    published before kickoff has him rank 1, and he started and threw 32
+    attempts.
     """
+    from .teams import canonical
+
     out = df.copy()
     ts = pd.to_datetime(out["dt"], format="ISO8601", utc=True, errors="coerce")
 
@@ -442,23 +452,40 @@ def _attach_week_from_timestamp(df: pd.DataFrame, season: int) -> pd.DataFrame:
     if s.empty:
         out["week"] = pd.NA
         return out
-    kick = kickoff_series(s).dt.tz_convert("UTC")
-    week_start = (
-        pd.DataFrame({"week": s["week"].to_numpy(), "kick": kick.to_numpy()})
-        .groupby("week", as_index=False)["kick"].min()
-        .sort_values("kick")
-        .reset_index(drop=True)
-    )
 
-    # searchsorted on week-start boundaries: index i means "before week i+1".
-    bounds = week_start["kick"].to_numpy()
-    idx = bounds.searchsorted(ts.to_numpy(), side="left")
-    # searchsorted returns len(bounds) for a timestamp after every kickoff.
-    # That is the post-season and offseason, which belongs to no week here, so
-    # it is marked rather than clipped onto the last one.
-    after_season = idx >= len(week_start)
-    out["week"] = week_start["week"].to_numpy()[idx.clip(0, len(week_start) - 1)]
-    out.loc[ts.isna() | after_season, "week"] = pd.NA
+    kick = kickoff_series(s).dt.tz_convert("UTC")
+    # One row per (team, week, kickoff), both sides of every game. Canonical,
+    # because the schedule spells relocated franchises OAK/SD while the depth
+    # charts spell them LV/LAC, and an unmatched team would get no week at all.
+    per_team = pd.concat([
+        pd.DataFrame({"_tm": s[side].map(canonical).to_numpy(),
+                      "_wk": s["week"].to_numpy().astype("int64"),
+                      "_kick": kick.to_numpy()})
+        for side in ("home_team", "away_team")
+    ], ignore_index=True).sort_values("_kick").reset_index(drop=True)
+
+    # merge_asof(direction="forward") IS this operation: for each snapshot, the
+    # earliest kickoff at or after it, within that team. Done as a per-team
+    # Python loop first, which took load_depth_charts from 1s to 9.4s on the
+    # 554,215-row file and produced an object-dtype column that made every
+    # downstream sort slow.
+    left = pd.DataFrame({"_ts": ts.to_numpy(),
+                         "_tm": (out["team"].map(canonical).to_numpy()
+                                 if "team" in out.columns
+                                 else np.full(len(out), None))})
+    left["_row"] = np.arange(len(left))
+    ok = left["_ts"].notna() & left["_tm"].notna()
+    matched = pd.merge_asof(
+        left[ok].sort_values("_ts"), per_team,
+        left_on="_ts", right_on="_kick", by="_tm", direction="forward")
+
+    week = np.full(len(out), np.nan)
+    week[matched["_row"].to_numpy()] = matched["_wk"].to_numpy(dtype="float64")
+    # A snapshot after that team's last kickoff matches nothing and stays NaN:
+    # the postseason and offseason belong to no week here. They used to be
+    # CLIPPED onto the final week, which put March information into a pregame
+    # feature.
+    out["week"] = week
     return out
 
 

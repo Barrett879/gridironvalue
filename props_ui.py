@@ -597,10 +597,18 @@ def _fmt_gap(r) -> str:
             # A gap too small to show at this precision, but a side IS leaned.
             # This used to return a bare, UNCOLOURED "0.0", so the row said
             # "More" beside a neutral zero and the reader had nothing to
-            # reconcile. Show the next decimal and keep the lean's colour, so a
-            # tiny edge reads as tiny rather than as a mistake.
-            return (f'<span class="num diff {cls}">'
-                    f'{float(d):+.2f}</span>')
+            # reconcile.
+            fine = round(float(d), 2)
+            if fine:
+                # Visible at two decimals: show it, in the lean's colour.
+                return f'<span class="num diff {cls}">{fine:+.2f}</span>'
+            # Below two decimals. The median IS the line to the precision
+            # anyone can read, and the lean comes from the probability rather
+            # than the gap, so print a marker instead of inventing digits or
+            # rendering a signed zero. Trey McBride's 8.0 targets against an
+            # 8.0 line with P(over) 0.495 is a real Less and a gap of nothing.
+            return f'<span class="num diff {cls}">&lt;0.01</span>'
+
         # Avoid "-0.0", which reads as a typo. A gap that rounds away is zero.
         return f'<span class="num diff">0.0</span>'
     return f'<span class="num diff {cls}">{v:+.{dec}f}</span>'
