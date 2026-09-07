@@ -268,6 +268,16 @@ _TIER_CLASS = {"strong": "t-strong", "moderate": "t-mod", "weak": "t-weak",
                "none": "t-none", "negative": "t-neg", "unmeasured": "t-unk"}
 
 
+# Provenance badges. ONE definition, because the ledger rendered three and the
+# per-player rows rendered one, so the same row carried a "low conf" marker in
+# the table and nothing at all under the player it belongs to.
+_SRC_BADGE = {
+    "baseline": ' <span class="gv-src base">baseline</span>',
+    "model_low_confidence": ' <span class="gv-src low">low conf</span>',
+    "composite": ' <span class="gv-src comp">composed</span>',
+}
+
+
 def _tier_badge(tier, edge) -> str:
     """How much this stat's lean is actually worth, measured.
 
@@ -510,13 +520,7 @@ def _ledger_html(table: pd.DataFrame) -> str:
         # exactly the rows where the two disagree, which is the whole point of
         # the change.
         cls = _lean_cls(r.get("lean"))
-        badge = ""
-        if r["source"] == "baseline":
-            badge = '<span class="gv-src base">baseline</span>'
-        elif r["source"] == "model_low_confidence":
-            badge = '<span class="gv-src low">low conf</span>'
-        elif r["source"] == "composite":
-            badge = '<span class="gv-src comp">composed</span>'
+        badge = _SRC_BADGE.get(str(r.get("source") or ""), "")
         rows.append(
             f'<div class="gv-ledger-row">'
             f'<span class="nm">{esc(r["player"])}'
@@ -621,8 +625,12 @@ def render_player_lines(lines_for_player: list) -> str:
     rows = []
     for p in lines_for_player:
         cls = _lean_cls(p.get("lean"))
-        badge = (' <span class="gv-src base">baseline</span>'
-                 if p["source"] == "baseline" else "")
+        # THE SAME THREE the ledger renders. This badged only "baseline", so a
+        # number served from a model that failed its ship gate, or composed
+        # from several projections, appeared under a player's own row with no
+        # marker at all: the row said 39% and nothing said where that came
+        # from. The provenance is the point of the badge.
+        badge = _SRC_BADGE.get(str(p.get("source") or ""), "")
         rows.append(
             f'<div class="gv-pl-row">'
             f'<span class="st">{esc(p["stat"])}'

@@ -641,7 +641,20 @@ def reliability_for(columns) -> dict:
     worst = max(rows["tier"], key=lambda t: TIER_ORDER.get(str(t), 2))
     hit = rows[rows["tier"] == worst].iloc[0]
     edge = hit.get("side_edge_pts")
-    return {"tier": str(worst),
+    tier = str(worst)
+    # A TIER MEANS A MEASUREMENT. The whole badge system reports side-picking
+    # edge, and seven rows of the table carry a hand-assigned tier with
+    # `side_edge_pts` empty and `measured_on` reading "not measured": for
+    # passing_interceptions the note is "barely cleared its ship gate on MAE".
+    # That is a judgement about central accuracy, not about which side to take,
+    # and rendering it as "weak" put it on exactly the same visual footing as
+    # receiving yards, whose "weak" IS a measured +2.9. The tooltip already
+    # said "not measured" while the badge beside it said "weak".
+    # Weakest link, same rule the tier itself follows: a combination prop is
+    # only as trustworthy as its least-measured component.
+    if rows["side_edge_pts"].isna().any():
+        tier = "unmeasured"
+    return {"tier": tier,
             "edge": None if pd.isna(edge) else float(edge),
             "note": str(hit.get("note") or "")}
 
@@ -1052,6 +1065,20 @@ def compare(lines: pd.DataFrame, proj: pd.DataFrame,
         sources = {t: m.get("present_as", "model")
                    for t, m in registry.get("targets", {}).items()}
 
+    def _src_of(col, row):
+        """Provenance of ONE projected column, for THIS player.
+
+        The projection frame carries a `{target}_source` per row, which is the
+        served truth; the registry is the fallback for a frame that predates
+        those columns. Preferring the row means a target that fell back to a
+        baseline for one player and not another is labelled per player, which
+        is what the badge claims to mean.
+        """
+        v = row.get(f"{col}_source")
+        if v is not None and not pd.isna(v):
+            return str(v)
+        return sources.get(col, "model")
+
     rows = []
     for _, ln in lines.iterrows():
         cols, scale, refusal = _resolve_stat(ln.get("stat_type"))
@@ -1085,7 +1112,10 @@ def compare(lines: pd.DataFrame, proj: pd.DataFrame,
                 meta["unprojected_stat"] += 1
                 continue
             model_val = sum(float(v) * float(w) for v, (_, w) in zip(vals, pairs))
-            src = "model_low_confidence"
+            _wsrcs = {_src_of(c_, p) for c_, _ in pairs}
+            src = ("baseline" if "baseline" in _wsrcs
+                   else "model_low_confidence" if "model_low_confidence" in _wsrcs
+                   else "model")
         elif cols and cols[0] == "__prob__":
             parts = [p.get(c) for c in cols[1:]]
             lam = sum(float(v) for v in parts
@@ -1106,9 +1136,23 @@ def compare(lines: pd.DataFrame, proj: pd.DataFrame,
             model_val = min(_u.CEIL, max(_u.FLOOR,
                             poisson_at_least(lam, threshold_for_line(line_val))))
             kind, compare_to = "probability", 0.5
-            # Both components are served from a baseline; they lose the ship
-            # gate to a season-to-date mean. Labelled, never dressed up.
-            src = "baseline"
+            # DERIVED from the components, exactly as the mean branch below
+            # does it. This was hardcoded `src = "baseline"` on a comment that
+            # said "both components are served from a baseline", which was true
+            # when __prob__ only handled anytime TDs (rushing_tds and
+            # receiving_tds, both baseline). Routing Pass TDs, INT, Sacks and
+            # FG Made through the same sentinel made it a lie: on the committed
+            # week 1 board, 88 of 453 probability rows wore a BASELINE badge
+            # over a number that came from a model. passing_tds and
+            # sacks_suffered are plain "model"; passing_interceptions and
+            # fg_made are "model_low_confidence". The badge is load-bearing,
+            # because a reader is entitled to know a number came from a model
+            # that failed its ship gate, and equally entitled not to be told
+            # that about one that did not.
+            srcs = {_src_of(c, p) for c in cols[1:]}
+            src = ("baseline" if "baseline" in srcs
+                   else "model_low_confidence" if "model_low_confidence" in srcs
+                   else "model")
         elif cols == ("__fantasy__",):
             model_val = float(p["_fantasy"])
             src = "composite"
@@ -1125,7 +1169,7 @@ def compare(lines: pd.DataFrame, proj: pd.DataFrame,
                 meta["unprojected_stat"] += 1
                 continue
             model_val = float(sum(float(v) for v in vals)) * float(scale)
-            srcs = {sources.get(c, "model") for c in cols}
+            srcs = {_src_of(c, p) for c in cols}
             src = ("baseline" if "baseline" in srcs
                    else "model_low_confidence" if "model_low_confidence" in srcs
                    else "model")

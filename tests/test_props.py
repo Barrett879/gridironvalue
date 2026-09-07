@@ -937,6 +937,11 @@ def _td_proj(rush_td=0.35, rec_td=0.34):
         "opponent_team": "CLE", "gsis_id": "00-0036900",
         "game_id": "2026_01_CIN_CLE", "rushing_tds": rush_td,
         "receiving_tds": rec_td, "f_games_prior": 50.0, "p_play": 0.95,
+        # The real projection frame carries a per-row provenance column for
+        # every target, and compare() reads it. Both TD models lose the ship
+        # gate and are served from a season-to-date baseline, so the fixture
+        # says so rather than leaving compare() to guess.
+        "rushing_tds_source": "baseline", "receiving_tds_source": "baseline",
         "passing_yards": 0.0, "rushing_yards": 10.0, "receiving_yards": 80.0,
         "receptions": 6.0, "targets": 9.0, "carries": 1.0, "attempts": 0.0,
         "completions": 0.0, "passing_tds": 0.0, "passing_interceptions": 0.0,
@@ -1993,3 +1998,84 @@ def test_a_non_finite_line_is_rejected_not_crashed_on():
         props.compare(bad, proj, predict.load_registry())     # must not raise
     finally:
         logging.disable(logging.NOTSET)
+
+
+def test_a_probability_row_reports_its_real_provenance():
+    """The badge is load-bearing and it was hardcoded.
+
+    `src = "baseline"` was set for the whole __prob__ branch on a comment
+    reading "both components are served from a baseline". That was true when
+    __prob__ only handled anytime TDs (rushing_tds and receiving_tds, both
+    baseline). Routing Pass TDs, INT, Sacks and FG Made through the same
+    sentinel made it a lie: 88 of 453 probability rows on the committed week 1
+    board wore a BASELINE badge over a number that came from a model.
+
+    A reader is entitled to know a number came from a model that failed its
+    ship gate, and equally entitled not to be told that about one that did not.
+    """
+    from gridlib import predict, props
+
+    proj = predict.project_week_cached(2026, 1)
+    lines = props.load_lines(2026, 1)
+    if proj is None or proj.empty or lines is None or lines.empty:
+        pytest.skip("no committed board for 2026 week 1")
+    table, _meta = props.compare(lines, proj, predict.load_registry())
+    prob = table[table["kind"] == "probability"]
+    if prob.empty:
+        pytest.skip("no probability rows")
+
+    row = proj.iloc[0]
+    component_of = {"INT": "passing_interceptions", "Pass TDs": "passing_tds",
+                    "FG Made": "fg_made", "Rush TDs": "rushing_tds",
+                    "Rec TDs": "receiving_tds"}
+    wrong = []
+    for stat, col in component_of.items():
+        got = prob[prob["stat"] == stat]
+        truth = row.get(f"{col}_source")
+        if got.empty or truth is None or pd.isna(truth):
+            continue
+        labelled = set(got["source"].unique())
+        if labelled != {str(truth)}:
+            wrong.append((stat, sorted(labelled), str(truth)))
+    assert not wrong, (
+        "probability rows labelled with a provenance they do not have "
+        f"(stat, labelled, actual): {wrong}"
+    )
+    assert not (set(prob["source"]) == {"baseline"}), (
+        "every probability row is labelled baseline again, which is the "
+        "hardcoded value rather than a derived one"
+    )
+
+
+def test_an_unmeasured_stat_does_not_wear_a_measured_tier():
+    """The tier badge reports SIDE-PICKING edge, so a stat with none is
+    unmeasured, whatever tier the table hand-assigns.
+
+    Seven rows of data/stat_reliability.csv carry a tier with `side_edge_pts`
+    empty and `measured_on` reading "not measured". For passing_interceptions
+    the note is "barely cleared its ship gate on MAE (+1.8%)", which is a
+    judgement about central accuracy and not about which side to take. Rendered
+    as "weak" it sat on exactly the same visual footing as receiving yards,
+    whose "weak" is a measured +2.9, while the tooltip beside it already said
+    "not measured".
+    """
+    import pandas as pd
+
+    from gridlib import props
+
+    tbl = props.reliability_table()
+    if tbl.empty:
+        pytest.skip("reliability table not available")
+    unmeasured = tbl[tbl["side_edge_pts"].isna()]["stat"].tolist()
+    assert unmeasured, "expected some stats to have no side-picking measurement"
+    for stat in unmeasured:
+        got = props.reliability_for((stat,))
+        assert got["tier"] == "unmeasured", (
+            f"{stat} has no side_edge_pts but renders as {got['tier']!r}"
+        )
+        assert got["edge"] is None
+    # ...and a genuinely measured one keeps its tier
+    measured = tbl[tbl["side_edge_pts"].notna()]
+    if not measured.empty:
+        stat = str(measured.iloc[0]["stat"])
+        assert props.reliability_for((stat,))["tier"] != "unmeasured"
