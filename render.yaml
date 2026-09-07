@@ -8,14 +8,31 @@ services:
     plan: starter          # free tier sleeps; a sleeping app loses nothing but is slow to wake
     buildCommand: pip install -r requirements.txt
     # $PORT is assigned by Render. --server.headless keeps Streamlit from trying
-    # to open a browser. enableCORS false is required behind their proxy.
+    # to open a browser.
+    #
+    # This used to pass --server.enableCORS false and
+    # --server.enableXsrfProtection false, on a comment claiming CORS had to be
+    # off behind Render's proxy. Measured against the pinned streamlit 1.59.1,
+    # those two flags make the app accept ANY origin:
+    #
+    #   as shipped:     allow_all_cross_origin_requests() True
+    #                   is_url_from_allowed_origins("https://evil.example") True
+    #   with defaults:  both False
+    #
+    # The proxy justification is about request ROUTING and does not require
+    # turning off cross-site request forgery protection on a page with a paste
+    # box that writes shared state. Both flags are gone.
+    #
+    # NOTE: this file is the ALTERNATIVE host. The live site is Streamlit
+    # Community Cloud (gridironvalue.streamlit.app), where none of these flags
+    # apply, so this change is untested against Render itself. If a Render
+    # deploy ever fails to connect its websocket, fix the proxy configuration
+    # rather than reinstating these.
     startCommand: >
       streamlit run app.py
       --server.port $PORT
       --server.address 0.0.0.0
       --server.headless true
-      --server.enableCORS false
-      --server.enableXsrfProtection false
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.8        # Render honours this; Streamlit Cloud does not

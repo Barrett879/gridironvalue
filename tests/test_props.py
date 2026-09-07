@@ -1647,3 +1647,119 @@ def test_board_suffix_stripping_is_linear():
         f"suffix stripping looks superlinear: {timings[0]:.3f}s then "
         f"{timings[1]:.3f}s for 4x the input"
     )
+
+
+def test_no_displayed_row_contradicts_itself():
+    """What a reader SEES must agree with the verdict beside it.
+
+    The lean is decided at full precision from p_over, but Model was rendered at
+    one decimal, so a 5.01 projection against a 5.0 line printed "5.0 vs 5.0,
+    More" and the gap came back as a bare, UNCOLOURED "0.0". Seven rows on the
+    committed 2026 week 1 board did exactly that. A reader has nothing to
+    reconcile there; it just looks broken.
+
+    This asserts the rendered strings, not the underlying floats, because the
+    rendering is where the contradiction lived.
+    """
+    import re
+
+    import props_ui
+    from gridlib import predict, props
+
+    lines = props.load_lines(2026, 1)
+    proj = predict.project_week_cached(2026, 1)
+    if lines is None or lines.empty or proj is None or proj.empty:
+        pytest.skip("no committed board for 2026 week 1")
+    table, _meta = props.compare(lines, proj, predict.load_registry())
+    shown, _hidden, _thin = props_ui.board_rows(table)
+    if shown.empty:
+        pytest.skip("nothing shown")
+
+    strip = lambda html: re.sub(r"<[^>]+>", "", html)
+    bad = []
+    for _i, row in shown[shown["kind"] == "mean"].iterrows():
+        lean = str(row.get("lean") or "")
+        if lean not in ("More", "Less"):
+            continue
+        model_txt = strip(props_ui._fmt_model(row))
+        gap_html = props_ui._fmt_gap(row)
+        gap_txt = strip(gap_html)
+        line_txt = f'{float(row["line"]):.2f}'
+        # 1. the displayed model must not equal the displayed line
+        if f'{float(model_txt):.2f}' == line_txt:
+            bad.append((row["player"], row["stat"], model_txt, gap_txt, lean,
+                        "model displays as the line itself"))
+            continue
+        # 2. the displayed gap must carry a sign that matches the lean
+        want = "+" if lean == "More" else "-"
+        if not gap_txt.startswith(want):
+            bad.append((row["player"], row["stat"], model_txt, gap_txt, lean,
+                        "gap sign disagrees with the lean"))
+            continue
+        # 3. and it must be coloured, not the neutral zero
+        if 'class="num diff"' in gap_html:
+            bad.append((row["player"], row["stat"], model_txt, gap_txt, lean,
+                        "a leaned row rendered the neutral uncoloured gap"))
+
+    assert not bad, "rows that contradict themselves on screen: " + repr(bad[:6])
+
+
+def test_clear_all_survives_the_next_rerun(tmp_path, monkeypatch):
+    """The button deleted the boards and the next script body wrote them back.
+
+    _clear_lines runs as an on_click callback, before the rerun's script body.
+    resolve_and_persist then re-parsed the still-populated paste box and saved
+    every line again, so "Clear all" appeared to do nothing. On the published
+    site it was inert for a second reason too: the read-only branch returned
+    before clearing the visitor's own session board.
+    """
+    import streamlit as st
+
+    import props_ui
+    from gridlib import cache, props
+
+    monkeypatch.setattr(props, "dc_path", lambda name: tmp_path / name)
+    monkeypatch.setattr(cache, "READ_ONLY", False)
+    st.session_state.clear()
+    try:
+        st.session_state["pp_paste"] = "Patrick Mahomes\nKC - QB\n245.5\nPass Yards\n"
+        props_ui.resolve_and_persist(2026, 1)
+        assert props_ui.saved_count(2026, 1) == 1, "the paste never saved"
+
+        props_ui._clear_lines(2026, 1)
+        assert props_ui.saved_count(2026, 1) == 0
+        assert st.session_state.get("pp_paste") == "", (
+            "the paste box was left populated, so the next rerun restores it"
+        )
+
+        props_ui.resolve_and_persist(2026, 1)          # the very next rerun
+        assert props_ui.saved_count(2026, 1) == 0, (
+            "Clear all was undone by the next rerun"
+        )
+    finally:
+        st.session_state.clear()
+
+
+def test_a_paste_is_applied_once_not_on_every_rerun(tmp_path, monkeypatch):
+    """Re-parsing, re-collapsing and re-saving a full slate on every unrelated
+    rerun is real work in the one process that serves every visitor."""
+    import streamlit as st
+
+    import props_ui
+    from gridlib import cache, props
+
+    monkeypatch.setattr(props, "dc_path", lambda name: tmp_path / name)
+    monkeypatch.setattr(cache, "READ_ONLY", False)
+    st.session_state.clear()
+    calls = []
+    real_parse = props.parse_any
+    monkeypatch.setattr(props, "parse_any",
+                        lambda t: (calls.append(t), real_parse(t))[1])
+    try:
+        st.session_state["pp_paste"] = "Patrick Mahomes\nKC - QB\n245.5\nPass Yards\n"
+        for _ in range(4):
+            props_ui.resolve_and_persist(2026, 1)
+        assert len(calls) == 1, f"the same paste was parsed {len(calls)} times"
+        assert props_ui.saved_count(2026, 1) == 1
+    finally:
+        st.session_state.clear()

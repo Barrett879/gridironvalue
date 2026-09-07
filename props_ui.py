@@ -105,7 +105,18 @@ def resolve_and_persist(season: int, week: int, games: pd.DataFrame | None = Non
     """
     note = ""
     txt = (st.session_state.get("pp_paste") or "").strip()
+    # APPLY EACH PASTE ONCE. This ran on every rerun for as long as the box
+    # stayed populated, which had two consequences. "Clear all" deleted the
+    # saved boards in its on_click callback and the very next script body
+    # re-parsed the untouched box and wrote every line straight back, so the
+    # button appeared to do nothing. And every unrelated rerun re-parsed,
+    # re-collapsed and re-saved the same board, which for a full slate is real
+    # work on the one process serving every visitor.
+    _digest = f"{season}:{week}:{hash(txt)}"
+    if txt and st.session_state.get("pp_applied") == _digest:
+        txt = ""
     if txt:
+        st.session_state["pp_applied"] = _digest
         got = props.parse_any(txt)
         if got is not None and got.empty:
             skipped = got.attrs.get("skipped_noname", 0)
@@ -531,7 +542,17 @@ def _fmt_model(r) -> str:
     50% chance of scoring one. Percent makes the units unmistakable."""
     if r.get("kind") == "probability":
         return f'<span class="num">{100 * float(r["model"]):.0f}%</span>'
-    return f'<span class="num">{r["model"]:.1f}</span>'
+    val = float(r["model"])
+    # One more decimal when rounding would print the LINE'S OWN NUMBER back.
+    # The lean is decided at full precision, so a 5.01 projection against a 5.0
+    # line is a real (if tiny) More; displayed at one decimal it read "5.0 vs
+    # 5.0, More", which is a contradiction on its face. 7 rows on the committed
+    # week 1 board did exactly that. Showing 5.01 makes a small edge look small
+    # instead of making it look wrong.
+    line = r.get("line")
+    if line is not None and not pd.isna(line) and round(val, 1) == round(float(line), 1):
+        return f'<span class="num">{val:.2f}</span>'
+    return f'<span class="num">{val:.1f}</span>'
 
 
 def _fmt_gap(r) -> str:
@@ -564,6 +585,15 @@ def _fmt_gap(r) -> str:
     dec = 0 if abs(float(d)) >= 10 else 1
     v = round(float(d), dec)
     if v == 0:
+        lean = str(r.get("lean") or "")
+        if lean in ("More", "Less"):
+            # A gap too small to show at this precision, but a side IS leaned.
+            # This used to return a bare, UNCOLOURED "0.0", so the row said
+            # "More" beside a neutral zero and the reader had nothing to
+            # reconcile. Show the next decimal and keep the lean's colour, so a
+            # tiny edge reads as tiny rather than as a mistake.
+            return (f'<span class="num diff {cls}">'
+                    f'{float(d):+.2f}</span>')
         # Avoid "-0.0", which reads as a typo. A gap that rounds away is zero.
         return f'<span class="num diff">0.0</span>'
     return f'<span class="num diff {cls}">{v:+.{dec}f}</span>'
@@ -604,6 +634,12 @@ def _clear_lines(season: int, week: int) -> None:
     nobody could reproduce. Pasting is allowed on the published board; deleting
     what shipped with it is not.
     """
+    # The visitor's OWN board goes first, and unconditionally. On the published
+    # site this is the only board they have, so returning early below without
+    # clearing it made the button do nothing at all for them.
+    st.session_state["pp_paste"] = ""
+    st.session_state.pop(_SESSION_LINES, None)
+    st.session_state.pop("pp_applied", None)
     if _read_only():
         return
     for w in props.saved_weeks(season):
