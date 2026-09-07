@@ -201,6 +201,14 @@ notes.append(
     "marked where they appear."
 )
 
+notes.append(
+    "<b>A stat written like INT 1+ is a chance, not a count.</b> Its Model "
+    "cell is the probability of clearing that many, and the Line cell beside "
+    "it is 0.50, the coin flip, so the Gap is how far from even the model puts "
+    "it. The threshold is already inside the number, which is why the stat "
+    "reads 1+ rather than 0.5."
+)
+
 if str(GAME.get("roof_type")) == "retractable":
     notes.append(
         "<b>This stadium has a retractable roof.</b> The feed records whether "

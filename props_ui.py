@@ -525,11 +525,11 @@ def _ledger_html(table: pd.DataFrame) -> str:
             f'<div class="gv-ledger-row">'
             f'<span class="nm">{esc(r["player"])}'
             f'<i>{esc(r["team"])} vs {esc(r.get("opponent") or "")}</i></span>'
-            f'<span class="st">{esc(r["stat"])}'
+            f'<span class="st">{_stat_label(r)}'
             f'{_tier_badge(r.get("tier"), r.get("tier_edge"))}'
             f'{_odds_badge(r.get("odds_type"))}{badge}</span>'
             f'{_fmt_model(r)}'
-            f'<span class="num line">{r["line"]:.1f}</span>'
+            f'{_fmt_line(r)}'
             f'{_fmt_gap(r)}'
             f'<span class="lean {cls}">{esc(r["lean"])}</span>'
             f"</div>")
@@ -552,7 +552,16 @@ def _fmt_model(r) -> str:
     a different and materially larger number: 0.69 expected touchdowns is only a
     50% chance of scoring one. Percent makes the units unmistakable."""
     if r.get("kind") == "probability":
-        return f'<span class="num">{100 * float(r["model"]):.0f}%</span>'
+        # A PLAIN DECIMAL, and the Line cell beside it shows 0.50. Both cells
+        # are then the same kind of number and the Gap between them is their
+        # difference, exactly as on every other row.
+        #
+        # This was "39%" against a Line of "0.5" and a Gap of "-11pt": three
+        # different units across one row, and the reader had to know that the
+        # 0.5 was a count of interceptions while the 39 was a probability. The
+        # percent was there to make the units unmistakable and instead made the
+        # row unreadable.
+        return f'<span class="num">{float(r["model"]):.2f}</span>'
     val = float(r["model"])
     # One more decimal when rounding would print the LINE'S OWN NUMBER back.
     # The lean is decided at full precision, so a 5.01 projection against a 5.0
@@ -564,6 +573,32 @@ def _fmt_model(r) -> str:
     if line is not None and not pd.isna(line) and round(val, 1) == round(float(line), 1):
         return f'<span class="num">{val:.2f}</span>'
     return f'<span class="num">{val:.1f}</span>'
+
+
+def _fmt_line(r) -> str:
+    """The number the Model cell is being compared against.
+
+    For a probability row that is 0.50, the coin flip, because the prop's own
+    line is already inside the probability: P(over 1.5) has consumed the 1.5.
+    Showing the raw 1.5 there put a count next to a probability and invited a
+    subtraction that means nothing. The threshold is carried in the stat label
+    instead, as "Pass TDs 2+", which says what the probability is ABOUT.
+    """
+    if r.get("kind") == "probability":
+        return '<span class="num line">0.50</span>'
+    return f'<span class="num line">{float(r["line"]):.1f}</span>'
+
+
+def _stat_label(r) -> str:
+    """The stat, plus the threshold when the number beside it is a probability."""
+    stat = str(r.get("stat") or "")
+    if r.get("kind") != "probability":
+        return esc(stat)
+    try:
+        k = props.threshold_for_line(float(r["line"]))
+    except (TypeError, ValueError):
+        return esc(stat)
+    return esc(f"{stat} {k}+")
 
 
 def _fmt_gap(r) -> str:
@@ -585,10 +620,11 @@ def _fmt_gap(r) -> str:
     """
     cls = _lean_cls(r.get("lean"))
     if r.get("kind") == "probability":
-        # A touchdown row's model value IS a probability, so its distance from
-        # the line is measured in percentage points away from a coin flip.
+        # The distance from the coin flip the Line cell shows, in the same
+        # units as both. No "pt" suffix: the two cells it sits between are
+        # plain decimals now, so this is just their difference.
         return (f'<span class="num diff {cls}">'
-                f'{100 * float(r["model"]) - 50:+.0f}pt</span>')
+                f'{float(r["model"]) - 0.5:+.2f}</span>')
     d = r.get("diff")
     if d is None or pd.isna(d):
         return f'<span class="num diff">{SENTINEL}</span>'
@@ -633,11 +669,11 @@ def render_player_lines(lines_for_player: list) -> str:
         badge = _SRC_BADGE.get(str(p.get("source") or ""), "")
         rows.append(
             f'<div class="gv-pl-row">'
-            f'<span class="st">{esc(p["stat"])}'
+            f'<span class="st">{_stat_label(p)}'
             f'{_tier_badge(p.get("tier"), p.get("tier_edge"))}'
             f'{_odds_badge(p.get("odds_type"))}{badge}</span>'
             f'{_fmt_model(p)}'
-            f'<span class="num line">{p["line"]:.1f}</span>'
+            f'{_fmt_line(p)}'
             f'{_fmt_gap(p)}'
             f'<span class="lean {cls}">{esc(p["lean"])}</span>'
             f"</div>")
