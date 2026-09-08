@@ -747,9 +747,17 @@ def render_input(season: int, week: int) -> None:
         added = st.button("Add these lines", type="primary", key="pp_add",
                           width="stretch")
     with c_clear:
+        # Enabled when there is anything to clear, INCLUDING this visitor's own
+        # session board and their unapplied paste. It gated on committed files
+        # alone, and only 2026 week 1 ships one, so on the published site a
+        # visitor who pasted a board for any other week could not remove it:
+        # the button they needed was greyed out because the file it was asking
+        # about was never theirs.
+        _has_own = (_session_board(season, week) is not None
+                    or bool((st.session_state.get("pp_paste") or "").strip()))
         st.button("Clear all", key="pp_clear", on_click=_clear_lines,
                   args=(season, week), width="stretch",
-                  disabled=not props.saved_weeks(season),
+                  disabled=not (props.saved_weeks(season) or _has_own),
                   help="Remove every saved line, this week and every other")
     st.caption(
         "A paste ADDS to what is saved, so stat tabs can come in one at a "
