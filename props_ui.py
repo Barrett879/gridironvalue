@@ -836,8 +836,17 @@ def render_week_record(season: int, weeks: list[int]) -> None:
         return
     rec = props.season_record(oos)
     if rec.get("decided"):
+        # TWO bars, and they are not the same bar. Clearing the do-nothing
+        # baseline says the model knows something. Clearing BREAK-EVEN says the
+        # picks would have made money, and that is a much higher line: a
+        # PrizePicks power play pays 3x on 2 legs, 5x on 3, 10x on 4, 20x on 5
+        # and 37.5x on 6, so a leg has to hit (1/payout)^(1/legs), which is
+        # 54.7% to 58.5% depending on the slip. Reporting only the first bar
+        # invites "an edge" to be read as "profitable", which it is not.
         verdict = ("an edge, on this evidence" if rec["beats_coin"]
                    else "not yet distinguishable from a coin")
+        _BREAKEVEN_LO, _BREAKEVEN_HI = 54.7, 58.5
+        _rate = float(rec.get("ci_low") or 0)
         st.markdown(
             '<div class="gv-window"><span class="lab">Season record, '
             'out of sample</span></div>', unsafe_allow_html=True)
@@ -848,9 +857,24 @@ def render_week_record(season: int, weeks: list[int]) -> None:
             f'common side would have won {rec.get("baseline", 50)}% for free, '
             f'so this is <b>{verdict}</b>. Graded against the projection frozen '
             f'when each line was first seen, never a recomputed one.'
-            + (f' {rec["ties"]} line(s) landed exactly on the number and are '
+            + (f' {rec["ties"]} line(s) landed exactly on the number. That '
+               'lowers the payout tier rather than pushing, so they are '
                'counted as neither.' if rec.get("ties") else "")
             + '</div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="gv-note"><b>Beating a coin is not the same as making '
+            f'money.</b> A PrizePicks power play pays 3x on two legs and up to '
+            f'37.5x on six, so a leg has to hit between '
+            f'{_BREAKEVEN_LO:.1f}% and {_BREAKEVEN_HI:.1f}% just to break '
+            f'even, depending on the slip. '
+            + (f'The lower bound of the interval above is {_rate:.1f}%, so on '
+               'this evidence the record does <b>not</b> clear that bar.'
+               if _rate < _BREAKEVEN_LO else
+               'The lower bound of the interval above clears that bar, which '
+               'is a stronger claim than the one on the line above and should '
+               'be read with the sample size in mind.')
+            + ' This is a projection model, not betting advice.</div>',
+            unsafe_allow_html=True)
     elif oos:
         st.markdown(
             '<div class="gv-note">Boards are on file but no out-of-sample week '
