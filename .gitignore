@@ -28,6 +28,7 @@ cache/*
 # was checked and did exactly that before these were un-ignored.
 !cache/prob_calibration_v1.parquet
 !cache/mean_calibration_v1.parquet
+!cache/accuracy_history_v1.parquet
 
 # Per-game weather from Open-Meteo. Committed because refetching it is 364 API
 # calls against a free service, and because the backfill build reads it.

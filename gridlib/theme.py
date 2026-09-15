@@ -43,6 +43,7 @@ THEME_DEFAULT_DARK = False
 # rather than a missing feature. Accuracy (spec step 5) is not built yet, so it
 # is not linked; the week-by-week table on /Props carries that role for now.
 _NAV_PAGES = [
+    ("Accuracy", "/Accuracy"),
     ("About", "/About"),
 ]
 

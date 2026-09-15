@@ -865,3 +865,95 @@ def test_a_player_is_served_under_the_position_he_trained_as():
         "served under a position they never trained as:\n"
         + disagree.head(8).to_string(index=False)
     )
+
+
+def test_the_accuracy_history_is_strictly_out_of_sample():
+    """The page built on this claims every row was projected by a model that
+    had never seen the season it is scoring.
+
+    The SHIPPED models are trained through 2025, so a row scored against them
+    for 2025 would be the model marking its own paper, and the resulting
+    "accuracy" would be a report on memorisation. The tracker refits per fold;
+    this asserts the artifact it produced actually has that shape, because the
+    claim is on a public page and nothing else checks it.
+    """
+    from gridlib.cache import dc_path, read_parquet_or_none
+
+    acc = read_parquet_or_none(dc_path("accuracy_history_v1.parquet"))
+    if acc is None or acc.empty:
+        pytest.skip("accuracy history not built")
+    assert {"season", "trained_through"} <= set(acc.columns)
+    bad = acc[acc["trained_through"] >= acc["season"]]
+    assert bad.empty, (
+        "these rows were scored by a model that had seen the season:\n"
+        + bad.groupby(["season", "trained_through"]).size().to_string()
+    )
+
+
+def test_the_accuracy_history_supports_a_paired_comparison():
+    """The page averages the model column and the baseline column.
+
+    pandas averages each independently, so a row carrying a model error but no
+    baseline error lifts the model column alone. On the sibling MLB site that
+    exact artifact turned a true -0.07% into a published +4.60%. The page drops
+    unpaired rows; this asserts the tracker does not manufacture them in the
+    first place, and that the history has no duplicate scorings inflating n.
+    """
+    from gridlib.cache import dc_path, read_parquet_or_none
+
+    acc = read_parquet_or_none(dc_path("accuracy_history_v1.parquet"))
+    if acc is None or acc.empty:
+        pytest.skip("accuracy history not built")
+
+    unpaired = acc[acc[["abs_err_model", "abs_err_b2"]].isna().any(axis=1)]
+    assert len(unpaired) <= 0.01 * len(acc), (
+        f"{len(unpaired)} of {len(acc)} rows cannot be compared in pairs"
+    )
+    dupes = acc.duplicated(["season", "week", "gsis_id", "target"]).sum()
+    assert dupes == 0, f"{dupes} duplicate scorings would inflate every count"
+
+    # And the errors must actually be the errors, not a column that drifted.
+    import numpy as np
+    sample = acc.dropna(subset=["pred", "actual", "abs_err_model"]).head(2000)
+    recomputed = (sample["pred"] - sample["actual"]).abs()
+    assert np.allclose(recomputed, sample["abs_err_model"], atol=1e-9), (
+        "abs_err_model is not |pred - actual|"
+    )
+
+
+def test_the_targets_the_site_serves_from_a_baseline_are_the_ones_that_lose():
+    """A consistency check between two independent measurements.
+
+    The registry marks a target `present_as = "baseline"` when it lost the ship
+    gate to a season-to-date average. The accuracy history is a separate,
+    per-row scoring of the same question over three seasons. If a target the
+    registry says loses turns up BEATING the average here, or vice versa, one
+    of the two is wrong and the page is quoting the wrong one.
+    """
+    from gridlib import predict
+    from gridlib.cache import dc_path, read_parquet_or_none
+
+    acc = read_parquet_or_none(dc_path("accuracy_history_v1.parquet"))
+    reg = predict.load_registry()
+    if acc is None or acc.empty or reg is None:
+        pytest.skip("accuracy history or registry not built")
+
+    paired = acc.dropna(subset=["abs_err_model", "abs_err_b2"])
+    edge = paired.groupby("target").apply(
+        lambda d: 100 * (1 - d.abs_err_model.mean() / d.abs_err_b2.mean()),
+        include_groups=False)
+
+    baseline_served = {t for t, m in reg["targets"].items()
+                       if m.get("present_as") == "baseline"}
+    disagree = []
+    for target, pct in edge.items():
+        served_from_baseline = target in baseline_served
+        loses_here = pct <= 0
+        if served_from_baseline != loses_here:
+            disagree.append((target, round(float(pct), 1),
+                             "served from a baseline" if served_from_baseline
+                             else "served from the model"))
+    assert not disagree, (
+        "the registry and the scored history disagree about which targets beat "
+        f"a season average: {disagree}"
+    )
