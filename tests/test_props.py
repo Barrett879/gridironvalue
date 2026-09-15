@@ -2079,3 +2079,66 @@ def test_an_unmeasured_stat_does_not_wear_a_measured_tier():
     if not measured.empty:
         stat = str(measured.iloc[0]["stat"])
         assert props.reliability_for((stat,))["tier"] != "unmeasured"
+
+
+def test_the_mirror_import_output_is_fenced_out_of_git():
+    """The only thing separating private curiosity from republishing.
+
+    scripts/import_mirror_lines.py grades the model against historical
+    PrizePicks lines read from a third-party mirror of their API. That mirror
+    has no licence and is automated collection of an API whose terms prohibit
+    exactly that, so its data and ANY aggregate derived from it must never be
+    committed. The sibling MLB site reached the same conclusion and deleted the
+    page that had displayed its summary.
+
+    A .gitignore edit that quietly un-ignores the output directory would turn a
+    private experiment into publication, so the rule is asserted here as well
+    as checked at runtime by the script itself.
+    """
+    import subprocess
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parent.parent
+    target = repo / "cache" / "local_only"
+    target.mkdir(parents=True, exist_ok=True)
+    probe = target / ".fence_probe"
+    probe.write_text("probe")
+    try:
+        ignored = subprocess.run(
+            ["git", "check-ignore", "-q", str(probe)],
+            cwd=repo, capture_output=True).returncode == 0
+    finally:
+        probe.unlink(missing_ok=True)
+    assert ignored, (
+        "cache/local_only/ is no longer git-ignored. Everything the mirror "
+        "importer writes derives from collection PrizePicks' terms prohibit "
+        "and must not be committed in any form, including an aggregate."
+    )
+
+
+def test_the_mirror_import_never_reaches_the_network():
+    """It reads a clone that already exists on disk. It does not fetch.
+
+    This project's hardest rule is that nothing in the props path fetches
+    PrizePicks. The importer is allowed to exist only because it reads local
+    git history; an import of requests or urllib here would make it the very
+    thing the rule forbids, wearing a different filename.
+    """
+    import ast
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent / "scripts"
+           / "import_mirror_lines.py")
+    if not src.exists():
+        pytest.skip("mirror importer not present")
+    tree = ast.parse(src.read_text())
+    NETWORK = {"requests", "urllib", "urllib3", "httpx", "aiohttp", "socket",
+               "ftplib", "websocket", "websockets", "curl_cffi", "pycurl"}
+    found = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            found |= {a.name.split(".")[0] for a in node.names} & NETWORK
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            if node.module.split(".")[0] in NETWORK:
+                found.add(node.module.split(".")[0])
+    assert not found, f"the mirror importer imports {sorted(found)}"

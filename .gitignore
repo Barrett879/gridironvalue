@@ -58,3 +58,14 @@ cache/*
 # Per-week projections are derived from the committed artifacts and are
 # regenerated on demand, version-stamped in the filename.
 cache/predictions_*.parquet
+
+# ── LOCAL ONLY, and this is a legal fence rather than tidiness ───────────────
+# scripts/import_mirror_lines.py grades the model against historical PrizePicks
+# lines taken from a third-party mirror of their API. That mirror has no licence
+# and is openly automated collection of an API whose terms prohibit exactly
+# that, so the data is fine for private curiosity on one machine and is NOT safe
+# to republish in any form, including a derived aggregate.
+#
+# The script refuses to run unless `git check-ignore` agrees this directory is
+# excluded, so do not narrow this rule.
+cache/local_only/
