@@ -1271,6 +1271,43 @@ ACTUAL_MAP = {
 }
 
 
+# The three offensive components the backfill sums into `fumbles_lost`
+# (scripts/build_player_week.py). The LIVE box score does not carry the summed
+# column, only the parts, and treating a missing fumble count as zero would
+# bias every actual Fantasy Score UPWARD, since the fumble term is negative.
+_FUMBLE_PARTS = ("rushing_fumbles_lost", "receiving_fumbles_lost",
+                 "sack_fumbles_lost")
+
+
+def actual_fantasy_score(row) -> float | None:
+    """PrizePicks Fantasy Score from a REAL box-score row.
+
+    The same PP_SCORING weights `predict.fantasy_score` applies to the
+    projection, applied to what happened, so the two sides of the comparison
+    are the same quantity. Returns None when the row carries none of the
+    scoring components at all, because a composite of nothing is 0.0 and 0.0
+    would grade as a real result.
+    """
+    from .predict import PP_SCORING
+
+    total, seen = 0.0, 0
+    for col, weight in PP_SCORING.items():
+        if col == "fumbles_lost":
+            parts = [row.get(c) for c in _FUMBLE_PARTS]
+            parts = [float(v) for v in parts if v is not None and pd.notna(v)]
+            if not parts:
+                # Absent, not zero. Skipped rather than scored as no fumbles.
+                continue
+            total += sum(parts) * weight
+            seen += 1
+            continue
+        v = row.get(ACTUAL_MAP.get(col, col))
+        if v is not None and pd.notna(v):
+            total += float(v) * weight
+            seen += 1
+    return round(total, 2) if seen else None
+
+
 def grade(table: pd.DataFrame, actuals: pd.DataFrame) -> pd.DataFrame:
     """Score a compared table against what actually happened.
 
@@ -1316,7 +1353,25 @@ def grade(table: pd.DataFrame, actuals: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for _, r in table.iterrows():
         cols, scale, refusal = _resolve_stat(r["stat"])
-        if cols is None or cols == ("__fantasy__",):
+        if cols is None:
+            continue
+        if cols == ("__fantasy__",):
+            # Graded, not skipped. This was `continue`, so 130 frozen Fantasy
+            # Score picks per week never entered the record at all: not counted
+            # as right, not as wrong, not as ungradeable. They were the single
+            # largest block on the 2026 week 1 board after touchdowns.
+            a_ = _actual_row(r)
+            if a_ is None:
+                continue
+            actual_val = actual_fantasy_score(a_)
+            if actual_val is None:
+                continue
+            result = ("More" if actual_val > r["line"]
+                      else "Less" if actual_val < r["line"] else "Exact")
+            rows.append({**r.to_dict(), "actual": round(actual_val, 2),
+                         "result": result,
+                         "model_correct": (None if result == "Exact"
+                                           else result == r["lean"])})
             continue
         if cols and cols[0] == "__prob__":
             # The MODEL value is a probability; the OUTCOME is a count. Grade the

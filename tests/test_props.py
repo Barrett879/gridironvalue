@@ -2142,3 +2142,55 @@ def test_the_mirror_import_never_reaches_the_network():
             if node.module.split(".")[0] in NETWORK:
                 found.add(node.module.split(".")[0])
     assert not found, f"the mirror importer imports {sorted(found)}"
+
+
+def test_fantasy_score_props_are_graded_not_silently_dropped():
+    """130 frozen picks a week were never entering the record at all.
+
+    grade() had `if cols is None or cols == ("__fantasy__",): continue`, so a
+    Fantasy Score pick was not counted right, not counted wrong, and not counted
+    as ungradeable. It simply vanished, and on the 2026 week 1 board that was
+    the largest block after touchdowns.
+
+    The actual side must be composed with the SAME PP_SCORING weights the
+    projection uses, or the two halves of the comparison are different
+    quantities.
+    """
+    from gridlib import predict, props
+
+    row = {"passing_yards": 221.0, "rushing_yards": -3.0, "passing_tds": 1.0,
+           "receptions": 0.0, "receiving_yards": 0.0, "receiving_tds": 0.0,
+           "rushing_tds": 0.0, "passing_interceptions": 0.0,
+           "rushing_fumbles_lost": 0.0, "receiving_fumbles_lost": 0.0,
+           "sack_fumbles_lost": 0.0}
+    want = (221.0 * 0.04) + (-3.0 * 0.10) + (1.0 * 4.0)
+    assert props.actual_fantasy_score(row) == pytest.approx(want, abs=0.011)
+
+    # The fumble term is NEGATIVE, so a missing fumble count must not be read
+    # as zero fumbles: that would bias every actual score upward. A row with
+    # none of the parts skips the term rather than scoring it.
+    no_fumbles = {k: v for k, v in row.items() if "fumble" not in k}
+    assert props.actual_fantasy_score(no_fumbles) == pytest.approx(want, abs=0.011)
+    with_one = dict(no_fumbles, rushing_fumbles_lost=2.0)
+    assert props.actual_fantasy_score(with_one) == pytest.approx(want - 2.0, abs=0.011)
+
+    # A row carrying no scoring component at all is not a 0.0 result.
+    assert props.actual_fantasy_score({"team": "KC"}) is None
+
+    # End to end on the committed board, if it has been played.
+    from gridlib import fetch
+    box = fetch.load_player_week(2026)
+    frozen = props.load_frozen(2026, 1)
+    if box is None or box.empty or frozen is None or frozen.empty:
+        return
+    actuals = box[(box["week"] == 1) & (box["season_type"] == "REG")].rename(
+        columns={"player_id": "gsis_id"})
+    if actuals.empty:
+        return
+    graded = props.grade(frozen, actuals)
+    n_frozen = int((frozen["stat"] == "Fantasy Score").sum())
+    n_graded = int((graded["stat"] == "Fantasy Score").sum())
+    if n_frozen:
+        assert n_graded > 0.8 * n_frozen, (
+            f"only {n_graded} of {n_frozen} Fantasy Score picks graded"
+        )
