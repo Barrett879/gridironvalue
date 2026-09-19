@@ -69,20 +69,48 @@ seasons = sorted(int(s) for s in acc["season"].dropna().unique())
 span = (f"{seasons[0]}" if len(seasons) == 1
         else f"{seasons[0]} to {seasons[-1]}")
 
+paired = acc.dropna(subset=["abs_err_model", "abs_err_b2"])
+dropped = len(acc) - len(paired)
+
+# ── WEEKS 1-3 ARE EXCLUDED, AND THE REASON IS NOT TIDINESS ──────────────────
+# Baseline 2 is the player's season-to-date average with this game excluded. In
+# week 1 no prior game exists, so it is null for 100% of players and falls back
+# to the training mean: a LEAGUE CONSTANT, identical for every player. This
+# project's own gate says beating a league constant "is table stakes and proves
+# nothing", so measuring against it is measuring against the wrong thing.
+#
+# It inflates the headline by about twice. Published over all weeks the model
+# reads +8.4%; from week 4, where the baseline is a real per-player average, it
+# reads +4.6%. The early number was mostly the baseline being broken.
+#
+#   wk 1 +26.3%   wk 2 +25.2%   wk 3 +17.6%   wk 4 +9.9%  ...  wk 10 +0.1%
+#
+# The decay is the baseline getting better, not the model getting worse.
+BASELINE_REAL_FROM = 4
+early = paired[paired["week"] < BASELINE_REAL_FROM]
+paired = paired[paired["week"] >= BASELINE_REAL_FROM]
+
 st.caption(
     f"Every projection below was made by a model trained only on seasons "
     f"BEFORE the one it is scoring, then compared against the real box score. "
-    f"{span}, {len(acc):,} player-games. The comparator is the same one the "
+    f"{span}, {len(paired):,} player-games. The comparator is the same one the "
     "models had to beat to ship: that player's own season-to-date average, "
     "this game excluded. Lower mean absolute error is better.")
+
+st.caption(
+    f"**Weeks 1 to {BASELINE_REAL_FROM - 1} are excluded**, which cuts the "
+    f"headline roughly in half and is the honest thing to do. That average "
+    "needs prior games to exist, and in week 1 it has none, so it collapses to "
+    "one league-wide constant for every player. Beating a league constant is "
+    "table stakes and proves nothing. Measured over all weeks the model reads "
+    f"+8.4%; from week {BASELINE_REAL_FROM} it reads +4.6%, and the difference "
+    "was the baseline being broken rather than the model being good.")
 
 # ── PAIRED, and this is not a detail ─────────────────────────────────────────
 # pandas averages each column independently, so a row that has a model error
 # but no baseline error (a player with no season-to-date history yet) would
 # lift the model column alone. On the sibling MLB site that exact artifact
 # turned a true -0.07% into a published +4.60%.
-paired = acc.dropna(subset=["abs_err_model", "abs_err_b2"])
-dropped = len(acc) - len(paired)
 
 summary = (paired.groupby("target")
            .agg(n=("abs_err_model", "size"),
